@@ -2,6 +2,14 @@
 
 This file provides guidance to AI agents when working with code in this repository.
 
+## Documentation Location
+
+For this workspace, maintain all future Multica documentation in:
+
+`/Users/dafu/Library/Mobile Documents/iCloud~md~obsidian/Documents/dafu-brain/网站/multica`
+
+When the user asks to "write a doc", "output documentation", or "update notes" for Multica, create or update files in that directory by default.
+
 ## Project Context
 
 Multica is an AI-native task management platform — like Linear, but with AI agents as first-class citizens.
