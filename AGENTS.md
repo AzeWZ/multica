@@ -6,6 +6,14 @@ This file provides guidance to AI agents when working with code in this reposito
 > All authoritative architecture, coding rules, commands, and conventions
 > live in **CLAUDE.md** at the project root. Read that file first.
 
+## Documentation Location
+
+For this workspace, maintain all future Multica documentation in:
+
+`/Users/dafu/Library/Mobile Documents/iCloud~md~obsidian/Documents/dafu-brain/网站/multica`
+
+When the user asks to "write a doc", "output documentation", or "update notes" for Multica, create or update files in that directory by default.
+
 ## Quick Reference
 
 ### Architecture

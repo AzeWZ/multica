@@ -50,3 +50,8 @@ _features/
 server/server
 data/
 .kilo
+.omx/
+
+/.idea
+/docs
+/github-download
