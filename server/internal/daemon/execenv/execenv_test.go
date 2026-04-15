@@ -390,6 +390,44 @@ func TestInjectRuntimeConfigClaude(t *testing.T) {
 	}
 }
 
+func TestInjectRuntimeConfigGemini(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+
+	ctx := TaskContextForEnv{
+		IssueID:     "test-issue-id",
+		AgentSkills: []SkillContextForEnv{{Name: "Writing", Content: "Write clearly."}},
+	}
+
+	if err := InjectRuntimeConfig(dir, "gemini", ctx); err != nil {
+		t.Fatalf("InjectRuntimeConfig failed: %v", err)
+	}
+
+	content, err := os.ReadFile(filepath.Join(dir, "GEMINI.md"))
+	if err != nil {
+		t.Fatalf("failed to read GEMINI.md: %v", err)
+	}
+
+	s := string(content)
+	for _, want := range []string{
+		"Multica Agent Runtime",
+		"multica issue get",
+		"Writing",
+	} {
+		if !strings.Contains(s, want) {
+			t.Errorf("GEMINI.md missing %q", want)
+		}
+	}
+
+	// Should not write CLAUDE.md or AGENTS.md for gemini provider.
+	if _, err := os.Stat(filepath.Join(dir, "CLAUDE.md")); !os.IsNotExist(err) {
+		t.Error("gemini provider should not create CLAUDE.md")
+	}
+	if _, err := os.Stat(filepath.Join(dir, "AGENTS.md")); !os.IsNotExist(err) {
+		t.Error("gemini provider should not create AGENTS.md")
+	}
+}
+
 func TestInjectRuntimeConfigCodex(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
@@ -918,5 +956,48 @@ func TestEnsureSymlinkRepairsBrokenLink(t *testing.T) {
 	data, _ := os.ReadFile(dst)
 	if string(data) != "real" {
 		t.Errorf("content = %q, want %q", data, "real")
+	}
+}
+
+func TestWriteReadGCMeta(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+
+	issueID := "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+	wsID := "ws-test-001"
+
+	if err := WriteGCMeta(dir, issueID, wsID); err != nil {
+		t.Fatalf("WriteGCMeta: %v", err)
+	}
+
+	meta, err := ReadGCMeta(dir)
+	if err != nil {
+		t.Fatalf("ReadGCMeta: %v", err)
+	}
+
+	if meta.IssueID != issueID {
+		t.Errorf("IssueID = %q, want %q", meta.IssueID, issueID)
+	}
+	if meta.WorkspaceID != wsID {
+		t.Errorf("WorkspaceID = %q, want %q", meta.WorkspaceID, wsID)
+	}
+	if meta.CompletedAt.IsZero() {
+		t.Error("CompletedAt should not be zero")
+	}
+}
+
+func TestWriteGCMeta_EmptyRoot(t *testing.T) {
+	t.Parallel()
+	if err := WriteGCMeta("", "issue", "ws"); err != nil {
+		t.Fatalf("expected nil for empty root, got %v", err)
+	}
+}
+
+func TestReadGCMeta_NoFile(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	_, err := ReadGCMeta(dir)
+	if err == nil {
+		t.Fatal("expected error for missing file")
 	}
 }

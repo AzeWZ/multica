@@ -2,47 +2,9 @@
 
 This file provides guidance to AI agents when working with code in this repository.
 
-## Documentation Location
-
-For this workspace, maintain all future Multica documentation in:
-
-`/Users/dafu/Library/Mobile Documents/iCloud~md~obsidian/Documents/dafu-brain/网站/multica`
-
-When the user asks to "write a doc", "output documentation", or "update notes" for Multica, create or update files in that directory by default.
-
-## Project Context
-
-Multica is an AI-native task management platform — like Linear, but with AI agents as first-class citizens.
-
-- Agents can be assigned issues, create issues, comment, and change status
-- Supports local (daemon) and cloud agent runtimes
-- Built for 2-10 person AI-native teams
-
-## Architecture
-
-**Go backend + standalone Next.js frontend.**
-
-- `server/` — Go backend (Chi router, sqlc for DB, gorilla/websocket for real-time)
-- `apps/web/` — Next.js 16 frontend (App Router) — self-contained, no shared package dependencies
-- `e2e/` — Playwright end-to-end tests
-- `scripts/` and root `Makefile` — local setup and verification
-
-### Web App Structure (`apps/web/`)
-
-The frontend uses a **feature-based architecture** with four layers:
-
-```
-apps/web/
-├── app/          # Routing layer (thin shells — import from features/)
-├── features/     # Business logic, organized by domain
-├── shared/       # Cross-feature utilities (api client, types, logger)
-├── test/         # Shared test utilities and setup
-├── public/       # Static assets
-```
-
-**`app/`** — Next.js App Router pages. Route files should be thin: import and re-export from `features/`. Layout components and route-specific glue (redirects, auth guards) live here. Shared layout components (e.g. `app-sidebar`) stay in `app/(dashboard)/_components/`.
-
-**`features/`** — Domain modules, each with its own components, hooks, stores, and config:
+> **Single source of truth:** This file is a concise pointer document.
+> All authoritative architecture, coding rules, commands, and conventions
+> live in **CLAUDE.md** at the project root. Read that file first.
 
 | Feature | Purpose | Exports |
 |---|---|---|
