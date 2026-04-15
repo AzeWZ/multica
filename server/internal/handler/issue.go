@@ -1122,6 +1122,13 @@ func (h *Handler) UpdateIssue(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Cancel active tasks when the issue is cancelled by a user.
+	// This is distinct from agent-managed status transitions — cancellation
+	// is a user-initiated terminal action that should stop execution.
+	if statusChanged && issue.Status == "cancelled" {
+		h.TaskService.CancelTasksForIssue(r.Context(), issue.ID)
+	}
+
 	writeJSON(w, http.StatusOK, resp)
 }
 
@@ -1212,6 +1219,8 @@ func (h *Handler) DeleteIssue(w http.ResponseWriter, r *http.Request) {
 	}
 
 	h.TaskService.CancelTasksForIssue(r.Context(), issue.ID)
+	// Fail any linked autopilot runs before delete (ON DELETE SET NULL clears issue_id).
+	h.Queries.FailAutopilotRunsByIssue(r.Context(), issue.ID)
 
 	// Collect all attachment URLs (issue-level + comment-level) before CASCADE delete.
 	attachmentURLs, _ := h.Queries.ListAttachmentURLsByIssueOrComments(r.Context(), issue.ID)
@@ -1411,6 +1420,11 @@ func (h *Handler) BatchUpdateIssues(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
+		// Cancel active tasks when the issue is cancelled by a user.
+		if statusChanged && issue.Status == "cancelled" {
+			h.TaskService.CancelTasksForIssue(r.Context(), issue.ID)
+		}
+
 		updated++
 	}
 
@@ -1451,6 +1465,7 @@ func (h *Handler) BatchDeleteIssues(w http.ResponseWriter, r *http.Request) {
 		}
 
 		h.TaskService.CancelTasksForIssue(r.Context(), issue.ID)
+		h.Queries.FailAutopilotRunsByIssue(r.Context(), issue.ID)
 
 		// Collect attachment URLs before CASCADE delete to clean up S3 objects.
 		attachmentURLs, _ := h.Queries.ListAttachmentURLsByIssueOrComments(r.Context(), issue.ID)
