@@ -3,6 +3,7 @@ import { createJSONStorage, persist } from "zustand/middleware";
 import { arrayMove } from "@dnd-kit/sortable";
 import { createPersistStorage, defaultStorage } from "@multica/core/platform";
 import { createSafeId } from "@multica/core/utils";
+import { isGlobalPath, isReservedSlug } from "@multica/core/paths";
 import type { DataRouter } from "react-router-dom";
 import { createTabRouter } from "../routes";
 
@@ -38,6 +39,15 @@ interface TabStore {
   updateTabHistory: (tabId: string, historyIndex: number, historyLength: number) => void;
   /** Reorder tabs by moving one from fromIndex to toIndex. Preserves router/history. */
   moveTab: (fromIndex: number, toIndex: number) => void;
+  /**
+   * Reset any tab whose first path segment references a workspace slug the
+   * current user doesn't have access to. Called after login + workspace list
+   * is populated (and on every subsequent list change, e.g. realtime
+   * workspace:deleted). Stale tabs get reset to `/` so IndexRedirect picks
+   * a valid workspace; tabs on global paths (/login, /workspaces/new, etc.)
+   * are untouched.
+   */
+  validateWorkspaceSlugs: (validSlugs: Set<string>) => void;
 }
 
 // ---------------------------------------------------------------------------
@@ -45,41 +55,93 @@ interface TabStore {
 // ---------------------------------------------------------------------------
 
 const ROUTE_ICONS: Record<string, string> = {
-  "/inbox": "Inbox",
-  "/my-issues": "CircleUser",
-  "/issues": "ListTodo",
-  "/projects": "FolderKanban",
-  "/agents": "Bot",
-  "/runtimes": "Monitor",
-  "/skills": "BookOpenText",
-  "/settings": "Settings",
+  inbox: "Inbox",
+  "my-issues": "CircleUser",
+  issues: "ListTodo",
+  projects: "FolderKanban",
+  autopilots: "ListTodo",
+  agents: "Bot",
+  runtimes: "Monitor",
+  skills: "BookOpenText",
+  settings: "Settings",
 };
 
-/** Resolve a route icon. Title is NOT determined here — it comes from document.title. */
+/**
+ * Resolve a route icon from a pathname. Title is NOT determined here — it
+ * comes from document.title.
+ *
+ * Path shape after the workspace URL refactor:
+ *  - workspace-scoped: `/{workspaceSlug}/{route}/...` → use segment index 1
+ *  - global (workspaces/new, invite, auth, login): `/{route}/...` → use segment index 0
+ *
+ * `isGlobalPath` is the single source of truth for which prefixes are global.
+ */
 export function resolveRouteIcon(pathname: string): string {
-  return ROUTE_ICONS[pathname]
-    ?? (pathname.startsWith("/issues/") ? "ListTodo" : undefined)
-    ?? (pathname.startsWith("/projects/") ? "FolderKanban" : undefined)
-    ?? "ListTodo";
+  const segments = pathname.split("/").filter(Boolean);
+  const routeSegment = isGlobalPath(pathname)
+    ? (segments[0] ?? "")
+    : (segments[1] ?? "");
+  return ROUTE_ICONS[routeSegment] ?? "ListTodo";
 }
 
 // ---------------------------------------------------------------------------
 // Store
 // ---------------------------------------------------------------------------
 
-const DEFAULT_PATH = "/issues";
+/**
+ * Sentinel path for new tabs with no explicit destination. The tab store is
+ * workspace-implicit — it doesn't know which workspace is active, so it can't
+ * build a `/:slug/issues` path itself. Instead we hand off to the router: `/`
+ * matches the top-level index route, which redirects to the workspace default
+ * (slug-aware redirect lives in routes.tsx / App.tsx).
+ *
+ * `title` and `icon` on the placeholder tab get overwritten by
+ * useTabRouterSync + useActiveTitleSync once the redirect resolves.
+ */
+const DEFAULT_PATH = "/";
 
 function createId(): string {
   return createSafeId();
 }
 
+/**
+ * Defensive: catch tab paths that were constructed without a workspace slug
+ * (e.g. a hardcoded "/issues" leftover from before the URL refactor). Such
+ * paths would get matched as `workspaceSlug="issues"` by the router and
+ * render NoAccessPage. Sanitize by falling back to "/" (IndexRedirect picks
+ * a valid workspace).
+ *
+ * Passes through:
+ *  - "/" and global paths (/login, /workspaces/new, /invite/..., /auth/...)
+ *  - workspace-scoped paths whose first segment is not a reserved word
+ *
+ * Rejects (and rewrites to "/"):
+ *  - Paths whose first segment is a reserved slug (=/=workspace slug), which
+ *    means the caller forgot to prefix the workspace. Logs a warning so the
+ *    buggy call site is easy to find.
+ */
+export function sanitizeTabPath(path: string): string {
+  if (path === DEFAULT_PATH || isGlobalPath(path)) return path;
+  const firstSegment = path.split("/").filter(Boolean)[0] ?? "";
+  if (isReservedSlug(firstSegment)) {
+    // eslint-disable-next-line no-console
+    console.warn(
+      `[tab-store] tab path "${path}" starts with reserved slug "${firstSegment}" — ` +
+        `caller likely forgot the workspace prefix. Falling back to "/".`,
+    );
+    return DEFAULT_PATH;
+  }
+  return path;
+}
+
 function makeTab(path: string, title: string, icon: string): Tab {
+  const safePath = sanitizeTabPath(path);
   return {
     id: createId(),
-    path,
+    path: safePath,
     title,
     icon,
-    router: createTabRouter(path),
+    router: createTabRouter(safePath),
     historyIndex: 0,
     historyLength: 1,
   };
@@ -160,6 +222,36 @@ export const useTabStore = create<TabStore>()(
     if (fromIndex === toIndex) return;
     set((s) => ({ tabs: arrayMove(s.tabs, fromIndex, toIndex) }));
   },
+
+  validateWorkspaceSlugs(validSlugs) {
+    const { tabs } = get();
+    let changed = false;
+    const nextTabs = tabs.map((t) => {
+      // Skip tabs on non-workspace-scoped paths — nothing to validate.
+      if (t.path === "/" || isGlobalPath(t.path)) return t;
+
+      const firstSegment = t.path.split("/").filter(Boolean)[0] ?? "";
+      if (validSlugs.has(firstSegment)) return t;
+
+      // Stale slug: dispose the old router and replace with a fresh one
+      // pointing at `/`. IndexRedirect will send the tab to a valid
+      // workspace (or /workspaces/new if the user now has none).
+      changed = true;
+      t.router.dispose();
+      return {
+        ...t,
+        path: DEFAULT_PATH,
+        title: "Issues",
+        icon: resolveRouteIcon(DEFAULT_PATH),
+        router: createTabRouter(DEFAULT_PATH),
+        historyIndex: 0,
+        historyLength: 1,
+      };
+    });
+
+    if (!changed) return;
+    set({ tabs: nextTabs });
+  },
     }),
     {
       name: "multica_tabs",
@@ -177,12 +269,22 @@ export const useTabStore = create<TabStore>()(
           | undefined;
         if (!persisted?.tabs?.length) return currentState;
 
-        const tabs: Tab[] = persisted.tabs.map((tab) => ({
-          ...tab,
-          router: createTabRouter(tab.path),
-          historyIndex: 0,
-          historyLength: 1,
-        }));
+        const tabs: Tab[] = persisted.tabs.map((tab) => {
+          // Sanitize persisted paths against reserved-slug rules. Catches
+          // both pre-refactor paths like "/issues/abc" (missing workspace
+          // slug) and any other malformed paths that slipped past the
+          // write-time guard. The defense across makeTab + merge + runtime
+          // validate ensures stale or malformed paths never reach the
+          // router.
+          const path = sanitizeTabPath(tab.path);
+          return {
+            ...tab,
+            path,
+            router: createTabRouter(path),
+            historyIndex: 0,
+            historyLength: 1,
+          };
+        });
 
         // Validate activeTabId — fall back to first tab if stale
         const activeTabId = tabs.some((t) => t.id === persisted.activeTabId)

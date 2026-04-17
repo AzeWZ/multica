@@ -10,6 +10,7 @@ import type { Issue, UpdateIssueRequest } from "@multica/core/types";
 import { CalendarDays } from "lucide-react";
 import { ActorAvatar } from "../../common/actor-avatar";
 import { useUpdateIssue } from "@multica/core/issues/mutations";
+import { useWorkspacePaths } from "@multica/core/paths";
 import { PriorityIcon } from "./priority-icon";
 import { PriorityPicker, AssigneePicker, DueDatePicker } from "./pickers";
 import { PRIORITY_CONFIG } from "@multica/core/issues/config";
@@ -66,7 +67,7 @@ export const BoardCardContent = memo(function BoardCardContent({
   const showDueDate = storeProperties.dueDate && issue.due_date;
 
   return (
-    <div className="rounded-lg border bg-card p-3.5 shadow-[0_1px_2px_0_rgba(0,0,0,0.03)] transition-shadow group-hover:shadow-sm">
+    <div className="rounded-lg border-[0.5px] bg-card py-3 px-2.5 shadow-[0_3px_6px_-2px_rgba(0,0,0,0.02),0_1px_1px_0_rgba(0,0,0,0.04)] transition-shadow group-hover:shadow-sm">
       {/* Row 1: Identifier */}
       <p className="text-xs text-muted-foreground">{issue.identifier}</p>
 
@@ -186,6 +187,7 @@ const animateLayoutChanges: AnimateLayoutChanges = (args) => {
 };
 
 export const DraggableBoardCard = memo(function DraggableBoardCard({ issue, childProgress }: { issue: Issue; childProgress?: ChildProgress }) {
+  const p = useWorkspacePaths();
   const {
     attributes,
     listeners,
@@ -213,7 +215,7 @@ export const DraggableBoardCard = memo(function DraggableBoardCard({ issue, chil
       className={isDragging ? "opacity-30" : ""}
     >
       <AppLink
-        href={`/issues/${issue.id}`}
+        href={p.issueDetail(issue.id)}
         className={`group block transition-colors ${isDragging ? "pointer-events-none" : ""}`}
       >
         <BoardCardContent issue={issue} editable childProgress={childProgress} />
