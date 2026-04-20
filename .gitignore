@@ -57,3 +57,7 @@ _features/
 server/server
 data/
 .kilo
+.idea
+/.idea
+/docs
+/github-download
