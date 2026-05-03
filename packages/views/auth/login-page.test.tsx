@@ -13,6 +13,7 @@ const mockApiVerifyCode = vi.hoisted(() => vi.fn());
 const mockApiSetToken = vi.hoisted(() => vi.fn());
 const mockApiGetMe = vi.hoisted(() => vi.fn());
 const mockApiIssueCliToken = vi.hoisted(() => vi.fn());
+const mockApiCreatePersonalAccessToken = vi.hoisted(() => vi.fn());
 const mockSetQueryData = vi.hoisted(() => vi.fn());
 
 vi.mock("@tanstack/react-query", async () => {
@@ -45,6 +46,7 @@ vi.mock("@multica/core/api", () => ({
     setToken: mockApiSetToken,
     getMe: mockApiGetMe,
     issueCliToken: mockApiIssueCliToken,
+    createPersonalAccessToken: mockApiCreatePersonalAccessToken,
   },
 }));
 
@@ -77,6 +79,9 @@ describe("LoginPage", () => {
     vi.clearAllMocks();
     // Default: no existing session (getMe rejects when no auth)
     mockApiGetMe.mockRejectedValue(new Error("unauthorized"));
+    mockApiCreatePersonalAccessToken.mockResolvedValue({
+      token: "cli-pat-token",
+    });
     localStorage.clear();
     // Reset window.location for tests that change it
     Object.defineProperty(window, "location", {
@@ -404,7 +409,7 @@ describe("LoginPage", () => {
     ).toBeInTheDocument();
   });
 
-  it("CLI authorize button redirects to callback URL", async () => {
+  it("CLI authorize button creates a PAT and redirects to callback URL", async () => {
     localStorage.setItem("multica_token", "existing-jwt");
     // Cookie attempt fails, localStorage fallback succeeds
     mockApiGetMe
@@ -433,10 +438,17 @@ describe("LoginPage", () => {
     const user = userEvent.setup();
     await user.click(screen.getByRole("button", { name: /^authorize$/i }));
 
-    expect(onTokenObtained).toHaveBeenCalled();
-    expect(window.location.href).toContain(
-      "http://localhost:9876/callback?token=existing-jwt&state=abc",
-    );
+    await waitFor(() => {
+      expect(mockApiSetToken).toHaveBeenCalledWith("existing-jwt");
+      expect(mockApiCreatePersonalAccessToken).toHaveBeenCalledWith({
+        name: "CLI (browser login)",
+        expires_in_days: 90,
+      });
+      expect(onTokenObtained).toHaveBeenCalled();
+      expect(window.location.href).toContain(
+        "http://localhost:9876/callback?token=cli-pat-token&state=abc",
+      );
+    });
   });
 
   it("'Use a different account' returns to email step", async () => {
@@ -498,14 +510,14 @@ describe("LoginPage", () => {
     expect(screen.getByText(/cookie@example.com/)).toBeInTheDocument();
   });
 
-  it("CLI authorize with cookie session calls issueCliToken and redirects", async () => {
+  it("CLI authorize with cookie session creates a PAT and redirects", async () => {
     // No localStorage token — getMe succeeds via cookie
     mockApiGetMe.mockResolvedValueOnce({
       id: "u-1",
       email: "cookie@example.com",
       name: "Cookie User",
     });
-    mockApiIssueCliToken.mockResolvedValueOnce({ token: "fresh-jwt" });
+    mockApiCreatePersonalAccessToken.mockResolvedValueOnce({ token: "fresh-pat" });
     const onTokenObtained = vi.fn();
 
     render(
@@ -524,10 +536,13 @@ describe("LoginPage", () => {
     await user.click(screen.getByRole("button", { name: /^authorize$/i }));
 
     await waitFor(() => {
-      expect(mockApiIssueCliToken).toHaveBeenCalled();
+      expect(mockApiCreatePersonalAccessToken).toHaveBeenCalledWith({
+        name: "CLI (browser login)",
+        expires_in_days: 90,
+      });
       expect(onTokenObtained).toHaveBeenCalled();
       expect(window.location.href).toContain(
-        "http://localhost:9876/callback?token=fresh-jwt&state=abc",
+        "http://localhost:9876/callback?token=fresh-pat&state=abc",
       );
     });
   });
@@ -539,6 +554,7 @@ describe("LoginPage", () => {
   it("CLI code verification redirects to callback URL", async () => {
     mockSendCode.mockResolvedValueOnce(undefined);
     mockApiVerifyCode.mockResolvedValueOnce({ token: "new-jwt-token" });
+    mockApiCreatePersonalAccessToken.mockResolvedValueOnce({ token: "new-cli-pat" });
     const onTokenObtained = vi.fn();
 
     render(
@@ -567,9 +583,14 @@ describe("LoginPage", () => {
         "cli@example.com",
         "654321",
       );
+      expect(mockApiSetToken).toHaveBeenCalledWith("new-jwt-token");
+      expect(mockApiCreatePersonalAccessToken).toHaveBeenCalledWith({
+        name: "CLI (browser login)",
+        expires_in_days: 90,
+      });
       expect(onTokenObtained).toHaveBeenCalled();
       expect(window.location.href).toContain(
-        "http://localhost:9876/callback?token=new-jwt-token&state=xyz",
+        "http://localhost:9876/callback?token=new-cli-pat&state=xyz",
       );
     });
 

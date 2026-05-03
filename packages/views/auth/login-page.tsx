@@ -71,6 +71,14 @@ function redirectToCliCallback(url: string, token: string, state: string) {
   window.location.href = `${url}${separator}token=${encodeURIComponent(token)}&state=${encodeURIComponent(state)}`;
 }
 
+async function createCliAccessToken(): Promise<string> {
+  const pat = await api.createPersonalAccessToken({
+    name: "CLI (browser login)",
+    expires_in_days: 90,
+  });
+  return pat.token;
+}
+
 /**
  * Validate that a CLI callback URL points to a safe host over HTTP.
  * Allows localhost and private/LAN IPs (RFC 1918) to support self-hosted setups
@@ -194,12 +202,14 @@ export function LoginPage({
       setError("");
       try {
         if (cliCallback) {
-          // CLI path: get token directly for the redirect URL
+          // CLI path: authenticate in the browser, then mint the PAT on the
+          // same API host before redirecting back to the local CLI callback.
           const { token } = await api.verifyCode(email, value);
           localStorage.setItem("multica_token", token);
           api.setToken(token);
+          const cliToken = await createCliAccessToken();
           onTokenObtained?.();
-          redirectToCliCallback(cliCallback.url, token, cliCallback.state);
+          redirectToCliCallback(cliCallback.url, cliToken, cliCallback.state);
           return;
         }
 
@@ -244,14 +254,16 @@ export function LoginPage({
       let token: string;
 
       if (authSourceRef.current === "localStorage") {
-        // Session was detected via localStorage — reuse that token directly.
+        // Session was detected via localStorage — authenticate requests with
+        // that token, but still hand the CLI a dedicated PAT.
         const stored = localStorage.getItem("multica_token");
         if (!stored) throw new Error("token missing");
-        token = stored;
+        api.setToken(stored);
+        token = await createCliAccessToken();
       } else {
-        // Session was detected via cookie — obtain a bearer token from the server.
-        const res = await api.issueCliToken();
-        token = res.token;
+        // Session was detected via cookie — the cookie authenticates this PAT
+        // creation request and the PAT is what gets handed to the CLI.
+        token = await createCliAccessToken();
       }
 
       onTokenObtained?.();

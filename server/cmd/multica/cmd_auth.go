@@ -231,8 +231,8 @@ func runAuthLoginBrowser(cmd *cobra.Command) error {
 
 	loginURL := fmt.Sprintf("%s/login?cli_callback=%s&cli_state=%s", appURL, url.QueryEscape(callbackURL), url.QueryEscape(state))
 
-	// Channel to receive the JWT from the browser callback.
-	jwtCh := make(chan string, 1)
+	// Channel to receive the browser-issued token from the callback.
+	tokenCh := make(chan string, 1)
 	errCh := make(chan error, 1)
 
 	mux := http.NewServeMux()
@@ -249,7 +249,7 @@ func runAuthLoginBrowser(cmd *cobra.Command) error {
 		}
 		w.Header().Set("Content-Type", "text/html")
 		w.Write([]byte(callbackSuccessHTML))
-		jwtCh <- token
+		tokenCh <- token
 	})
 
 	srv := &http.Server{Handler: mux}
@@ -267,42 +267,46 @@ func runAuthLoginBrowser(cmd *cobra.Command) error {
 	}
 	fmt.Fprintf(os.Stderr, "If the browser didn't open, visit:\n  %s\n\nWaiting for authentication...\n", loginURL)
 
-	// Wait for the JWT from the callback (timeout 5 minutes).
-	var jwtToken string
+	// Wait for the token from the callback (timeout 5 minutes).
+	var callbackToken string
 	select {
-	case jwtToken = <-jwtCh:
+	case callbackToken = <-tokenCh:
 	case err := <-errCh:
 		return fmt.Errorf("local server error: %w", err)
 	case <-time.After(5 * time.Minute):
 		return fmt.Errorf("timed out waiting for authentication")
 	}
 
-	// Use the JWT to create a PAT via the existing API.
-	client := cli.NewAPIClient(serverURL, "", jwtToken)
-
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
-	hostname, _ := os.Hostname()
-	if hostname == "" {
-		hostname = "unknown"
-	}
-	patName := fmt.Sprintf("CLI (%s)", hostname)
-	expiresInDays := 90
+	patToken := callbackToken
+	if !strings.HasPrefix(callbackToken, "mul_") {
+		// Older web clients hand the CLI a JWT. Convert it to a PAT here.
+		client := cli.NewAPIClient(serverURL, "", callbackToken)
 
-	var patResp struct {
-		Token string `json:"token"`
-	}
-	err = client.PostJSON(ctx, "/api/tokens", map[string]any{
-		"name":            patName,
-		"expires_in_days": expiresInDays,
-	}, &patResp)
-	if err != nil {
-		return fmt.Errorf("failed to create access token: %w", err)
+		hostname, _ := os.Hostname()
+		if hostname == "" {
+			hostname = "unknown"
+		}
+		patName := fmt.Sprintf("CLI (%s)", hostname)
+		expiresInDays := 90
+
+		var patResp struct {
+			Token string `json:"token"`
+		}
+		err = client.PostJSON(ctx, "/api/tokens", map[string]any{
+			"name":            patName,
+			"expires_in_days": expiresInDays,
+		}, &patResp)
+		if err != nil {
+			return fmt.Errorf("failed to create access token: %w", err)
+		}
+		patToken = patResp.Token
 	}
 
 	// Verify the PAT works.
-	patClient := cli.NewAPIClient(serverURL, "", patResp.Token)
+	patClient := cli.NewAPIClient(serverURL, "", patToken)
 	var me struct {
 		Name  string `json:"name"`
 		Email string `json:"email"`
@@ -316,7 +320,7 @@ func runAuthLoginBrowser(cmd *cobra.Command) error {
 	profile := resolveProfile(cmd)
 	cfg, _ := cli.LoadCLIConfigForProfile(profile)
 	cfg.WorkspaceID = ""
-	cfg.Token = patResp.Token
+	cfg.Token = patToken
 	cfg.ServerURL = serverURL
 	cfg.AppURL = appURL
 	if err := cli.SaveCLIConfigForProfile(cfg, profile); err != nil {
