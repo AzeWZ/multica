@@ -208,13 +208,10 @@ func (s *TaskService) EnqueueTaskForMention(ctx context.Context, issue db.Issue,
 // and switches to the quick-create prompt template; the completion path
 // uses RequesterID + WorkspaceID to write the inbox notification.
 type QuickCreateContext struct {
-	Type        string  `json:"type"`
-	Prompt      string  `json:"prompt"`
-	RequesterID string  `json:"requester_id"`
-	WorkspaceID string  `json:"workspace_id"`
-	Priority    *string `json:"priority,omitempty"`
-	DueDate     *string `json:"due_date,omitempty"`
-	ProjectID   *string `json:"project_id,omitempty"`
+	Type        string `json:"type"`
+	Prompt      string `json:"prompt"`
+	RequesterID string `json:"requester_id"`
+	WorkspaceID string `json:"workspace_id"`
 }
 
 // QuickCreateContextType marks a task as a quick-create job.
@@ -226,7 +223,7 @@ const QuickCreateContextType = "quick_create"
 // `multica issue create` call. Pre-validates that the agent is reachable
 // (not archived, has a runtime) so the API can reject up-front rather than
 // queue a task no one will ever claim.
-func (s *TaskService) EnqueueQuickCreateTask(ctx context.Context, workspaceID, requesterID pgtype.UUID, agentID pgtype.UUID, prompt string, opts ...func(*QuickCreateContext)) (db.AgentTaskQueue, error) {
+func (s *TaskService) EnqueueQuickCreateTask(ctx context.Context, workspaceID, requesterID pgtype.UUID, agentID pgtype.UUID, prompt string) (db.AgentTaskQueue, error) {
 	agent, err := s.Queries.GetAgent(ctx, agentID)
 	if err != nil {
 		return db.AgentTaskQueue{}, fmt.Errorf("load agent: %w", err)
@@ -243,9 +240,6 @@ func (s *TaskService) EnqueueQuickCreateTask(ctx context.Context, workspaceID, r
 		Prompt:      prompt,
 		RequesterID: util.UUIDToString(requesterID),
 		WorkspaceID: util.UUIDToString(workspaceID),
-	}
-	for _, opt := range opts {
-		opt(&payload)
 	}
 	contextJSON, err := json.Marshal(payload)
 	if err != nil {
@@ -368,6 +362,17 @@ func (s *TaskService) CancelTasksByTriggerComment(ctx context.Context, commentID
 		s.broadcastTaskEvent(ctx, protocol.EventTaskCancelled, t)
 	}
 	return nil
+}
+
+// BroadcastCancelledTasks reconciles each affected agent's status and emits
+// task:cancelled for every row. Callers must invoke this AFTER committing the
+// cancellation so subscribers don't observe a "cancelled" event for a row
+// that the tx might still roll back.
+func (s *TaskService) BroadcastCancelledTasks(ctx context.Context, cancelled []db.AgentTaskQueue) {
+	for _, t := range cancelled {
+		s.ReconcileAgentStatus(ctx, t.AgentID)
+		s.broadcastTaskEvent(ctx, protocol.EventTaskCancelled, t)
+	}
 }
 
 // CancelTask cancels a single task by ID. It broadcasts a task:cancelled event

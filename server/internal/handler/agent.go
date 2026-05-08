@@ -27,30 +27,30 @@ import (
 const maxAgentDescriptionLength = 255
 
 type AgentResponse struct {
-	ID                 string            `json:"id"`
-	WorkspaceID        string            `json:"workspace_id"`
-	RuntimeID          string            `json:"runtime_id"`
-	Name               string            `json:"name"`
-	Description        string            `json:"description"`
-	Instructions       string            `json:"instructions"`
-	AvatarURL          *string           `json:"avatar_url"`
-	RuntimeMode        string            `json:"runtime_mode"`
-	RuntimeConfig      any               `json:"runtime_config"`
-	CustomEnv          map[string]string `json:"custom_env"`
-	CustomArgs         []string          `json:"custom_args"`
-	McpConfig          json.RawMessage   `json:"mcp_config"`
-	CustomEnvRedacted  bool              `json:"custom_env_redacted"`
-	McpConfigRedacted  bool              `json:"mcp_config_redacted"`
-	Visibility         string            `json:"visibility"`
-	Status             string            `json:"status"`
-	MaxConcurrentTasks int32             `json:"max_concurrent_tasks"`
-	Model              string            `json:"model"`
-	OwnerID            *string           `json:"owner_id"`
-	Skills             []SkillResponse   `json:"skills"`
-	CreatedAt          string            `json:"created_at"`
-	UpdatedAt          string            `json:"updated_at"`
-	ArchivedAt         *string           `json:"archived_at"`
-	ArchivedBy         *string           `json:"archived_by"`
+	ID                 string              `json:"id"`
+	WorkspaceID        string              `json:"workspace_id"`
+	RuntimeID          string              `json:"runtime_id"`
+	Name               string              `json:"name"`
+	Description        string              `json:"description"`
+	Instructions       string              `json:"instructions"`
+	AvatarURL          *string             `json:"avatar_url"`
+	RuntimeMode        string              `json:"runtime_mode"`
+	RuntimeConfig      any                 `json:"runtime_config"`
+	CustomEnv          map[string]string   `json:"custom_env"`
+	CustomArgs         []string            `json:"custom_args"`
+	McpConfig          json.RawMessage     `json:"mcp_config"`
+	CustomEnvRedacted  bool                `json:"custom_env_redacted"`
+	McpConfigRedacted  bool                `json:"mcp_config_redacted"`
+	Visibility         string              `json:"visibility"`
+	Status             string              `json:"status"`
+	MaxConcurrentTasks int32               `json:"max_concurrent_tasks"`
+	Model              string              `json:"model"`
+	OwnerID            *string             `json:"owner_id"`
+	Skills             []AgentSkillSummary `json:"skills"`
+	CreatedAt          string              `json:"created_at"`
+	UpdatedAt          string              `json:"updated_at"`
+	ArchivedAt         *string             `json:"archived_at"`
+	ArchivedBy         *string             `json:"archived_by"`
 }
 
 func agentToResponse(a db.Agent) AgentResponse {
@@ -105,7 +105,7 @@ func agentToResponse(a db.Agent) AgentResponse {
 		MaxConcurrentTasks: a.MaxConcurrentTasks,
 		Model:              a.Model.String,
 		OwnerID:            uuidToPtr(a.OwnerID),
-		Skills:             []SkillResponse{},
+		Skills:             []AgentSkillSummary{},
 		CreatedAt:          timestampToString(a.CreatedAt),
 		UpdatedAt:          timestampToString(a.UpdatedAt),
 		ArchivedAt:         timestampToPtr(a.ArchivedAt),
@@ -158,6 +158,7 @@ type AgentTaskResponse struct {
 	CreatedAt               string                `json:"created_at"`
 	PriorSessionID          string                `json:"prior_session_id,omitempty"`          // session ID from a previous task on same issue
 	PriorWorkDir            string                `json:"prior_work_dir,omitempty"`            // work_dir from a previous task on same issue
+	WorkDir                 string                `json:"work_dir,omitempty"`                  // local working directory pinned for this task; populated once the daemon reports it
 	TriggerCommentID        *string               `json:"trigger_comment_id,omitempty"`        // comment that triggered this task
 	TriggerCommentContent   string                `json:"trigger_comment_content,omitempty"`   // content of the triggering comment
 	TriggerSummary          *string               `json:"trigger_summary,omitempty"`           // canonical short description snapshot — comment text / autopilot title — taken at task creation; survives source edits/deletes
@@ -172,9 +173,6 @@ type AgentTaskResponse struct {
 	AutopilotSource         string                `json:"autopilot_source,omitempty"`          // manual, schedule, webhook, or api
 	AutopilotTriggerPayload json.RawMessage       `json:"autopilot_trigger_payload,omitempty"` // optional trigger payload for webhook/api runs
 	QuickCreatePrompt       string                `json:"quick_create_prompt,omitempty"`       // user's natural-language input for quick-create tasks
-	QuickCreatePriority     string                `json:"quick_create_priority,omitempty"`     // priority explicitly selected in quick-create UI
-	QuickCreateDueDate      string                `json:"quick_create_due_date,omitempty"`     // due date explicitly selected in quick-create UI
-	QuickCreateProjectID    string                `json:"quick_create_project_id,omitempty"`   // project explicitly selected in quick-create UI
 	Kind                    string                `json:"kind"`                                // discriminator: "comment" | "autopilot" | "chat" | "quick_create" | "direct" — used by the activity row to label tasks that have no linked issue
 }
 
@@ -200,6 +198,10 @@ func taskToResponse(t db.AgentTaskQueue) AgentTaskResponse {
 	if t.FailureReason.Valid {
 		failureReason = t.FailureReason.String
 	}
+	workDir := ""
+	if t.WorkDir.Valid {
+		workDir = t.WorkDir.String
+	}
 	return AgentTaskResponse{
 		ID:               uuidToString(t.ID),
 		AgentID:          uuidToString(t.AgentID),
@@ -219,6 +221,7 @@ func taskToResponse(t db.AgentTaskQueue) AgentTaskResponse {
 		CreatedAt:        timestampToString(t.CreatedAt),
 		TriggerCommentID: uuidToPtr(t.TriggerCommentID),
 		TriggerSummary:   textToPtr(t.TriggerSummary),
+		WorkDir:          workDir,
 		// Surface task source so the UI can distinguish issue-linked tasks
 		// from chat-spawned or autopilot-spawned ones; all three may arrive
 		// with issue_id = "" once a task has no linked issue.
@@ -276,10 +279,10 @@ func (h *Handler) ListAgents(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "failed to load agent skills")
 		return
 	}
-	skillMap := map[string][]SkillResponse{}
+	skillMap := map[string][]AgentSkillSummary{}
 	for _, row := range skillRows {
 		agentID := uuidToString(row.AgentID)
-		skillMap[agentID] = append(skillMap[agentID], SkillResponse{
+		skillMap[agentID] = append(skillMap[agentID], AgentSkillSummary{
 			ID:          uuidToString(row.ID),
 			Name:        row.Name,
 			Description: row.Description,
@@ -311,15 +314,23 @@ func (h *Handler) GetAgent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	resp := agentToResponse(agent)
-	skills, err := h.Queries.ListAgentSkills(r.Context(), agent.ID)
+	// Use the summary query (no `content` column) — the embedded
+	// AgentSkillSummary only needs id/name/description, and reading large
+	// SKILL.md bodies just to discard them is the exact regression we fixed
+	// in #2174.
+	skills, err := h.Queries.ListAgentSkillSummaries(r.Context(), agent.ID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to load agent skills")
 		return
 	}
 	if len(skills) > 0 {
-		resp.Skills = make([]SkillResponse, len(skills))
+		resp.Skills = make([]AgentSkillSummary, len(skills))
 		for i, s := range skills {
-			resp.Skills[i] = skillToResponse(s)
+			resp.Skills[i] = AgentSkillSummary{
+				ID:          uuidToString(s.ID),
+				Name:        s.Name,
+				Description: s.Description,
+			}
 		}
 	}
 
