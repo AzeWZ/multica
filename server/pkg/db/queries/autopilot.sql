@@ -89,6 +89,51 @@ SET next_run_at = sqlc.narg('next_run_at'),
     updated_at = now()
 WHERE id = $1;
 
+-- name: GetWebhookTriggerByToken :one
+-- Look up a webhook trigger by its public bearer token. Joined to autopilot
+-- so the webhook handler can derive the workspace from the trigger's parent
+-- without trusting any request header. The handler still re-loads the
+-- Autopilot via GetAutopilot and cross-checks WorkspaceID matches the row's
+-- autopilot_workspace_id.
+SELECT t.*, a.workspace_id AS autopilot_workspace_id
+FROM autopilot_trigger t
+JOIN autopilot a ON a.id = t.autopilot_id
+WHERE t.kind = 'webhook'
+  AND t.webhook_token = $1;
+
+-- name: TouchAutopilotTriggerFiredAt :exec
+-- Bumps last_fired_at after a webhook fires, regardless of whether the
+-- dispatch succeeded, was admission-skipped, or even if Autopilot status
+-- transitioned to paused/disabled at exactly the wrong moment. Disabled /
+-- paused early-return paths in the handler never call this.
+UPDATE autopilot_trigger
+SET last_fired_at = now(),
+    updated_at = now()
+WHERE id = $1;
+
+-- name: RotateAutopilotTriggerWebhookToken :one
+-- Rotates the bearer token for a webhook trigger. Restricted to kind='webhook'
+-- so an accidental call against a schedule/api trigger is a no-op (returns no
+-- rows) rather than corrupting unrelated state.
+UPDATE autopilot_trigger
+SET webhook_token = $2,
+    updated_at = now()
+WHERE id = $1
+  AND kind = 'webhook'
+RETURNING *;
+
+-- name: SetAutopilotTriggerWebhookToken :one
+-- Sets the webhook token at creation time. CreateAutopilotTrigger inserts the
+-- row first (using its full 8-arg signature), then this query attaches the
+-- token. Splitting the create + token-set keeps the existing CreateAutopilotTrigger
+-- query usable by the schedule path without forcing every caller to think
+-- about webhook_token.
+UPDATE autopilot_trigger
+SET webhook_token = $2,
+    updated_at = now()
+WHERE id = $1
+RETURNING *;
+
 -- =====================
 -- Autopilot Run Management
 -- =====================
@@ -131,6 +176,27 @@ RETURNING *;
 -- name: UpdateAutopilotRunFailed :one
 UPDATE autopilot_run
 SET status = 'failed', completed_at = now(), failure_reason = $2
+WHERE id = $1
+RETURNING *;
+
+-- name: UpdateAutopilotRunSkipped :one
+-- Marks an autopilot_run as skipped without enqueueing any task. Used by the
+-- pre-flight admission check when the assignee agent's runtime is offline:
+-- creating an issue / task in that state would just pile a doomed job onto
+-- agent_task_queue (the canonical "持续给离线 local agent 入队" symptom from
+-- MUL-1899). Recording the skip + reason gives the UI / failure monitor / ops
+-- a paper trail without polluting the failure ratio.
+UPDATE autopilot_run
+SET status = 'skipped', completed_at = now(), failure_reason = $2
+WHERE id = $1
+RETURNING *;
+
+-- name: UpdateAutopilotRunSkippedWithResult :one
+UPDATE autopilot_run
+SET status = 'skipped',
+    completed_at = now(),
+    failure_reason = $2,
+    result = sqlc.narg('result')
 WHERE id = $1
 RETURNING *;
 
@@ -201,14 +267,19 @@ WHERE t.kind = 'schedule'
 
 -- name: SelectAutopilotsExceedingFailureThreshold :many
 -- Find active autopilots whose recent run failure rate exceeds the threshold.
--- Counts only terminal runs (completed | failed | skipped); pending,
--- issue_created and running are excluded so in-flight work isn't penalised.
+-- Counts only "real" terminal runs (completed | failed). 'skipped' is
+-- excluded from BOTH numerator and denominator: an admission-skipped run
+-- (e.g. assignee runtime offline at dispatch time, MUL-1899) is neither a
+-- success nor a failure, so it must not dilute the failure ratio (which
+-- would let a 100%-failing autopilot mask itself behind a wall of skips)
+-- nor inflate it. issue_created/running are still excluded so in-flight
+-- work isn't penalised.
 -- Used by the failure monitor to auto-pause sustained-failure autopilots
 -- (the canonical example from MUL-1336 was an autopilot scheduled every 5 min
 -- that 100% failed for days, burning ~1.5k useless tasks per week).
 WITH stats AS (
     SELECT autopilot_id,
-           count(*) FILTER (WHERE status IN ('completed', 'failed', 'skipped')) AS total,
+           count(*) FILTER (WHERE status IN ('completed', 'failed')) AS total,
            count(*) FILTER (WHERE status = 'failed') AS failed
     FROM autopilot_run
     WHERE created_at >= sqlc.arg('since')::timestamptz

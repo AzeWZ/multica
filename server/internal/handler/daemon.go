@@ -48,12 +48,27 @@ func (h *Handler) requireDaemonWorkspaceAccess(w http.ResponseWriter, r *http.Re
 		return true
 	}
 
-	// PAT/JWT fallback: verify user is a member of the workspace.
+	// PAT/JWT fallback: check membership cache before hitting DB.
+	userID := requestUserID(r)
+	if userID != "" {
+		if h.MembershipCache.Get(r.Context(), userID, workspaceID) {
+			return true
+		}
+	}
+
 	_, ok := h.requireWorkspaceMember(w, r, workspaceID, "not found")
+	if ok && userID != "" {
+		h.MembershipCache.Set(r.Context(), userID, workspaceID)
+	}
 	return ok
 }
 
 // requireDaemonRuntimeAccess looks up a runtime and verifies the caller owns its workspace.
+//
+// Only pgx.ErrNoRows is treated as a real "runtime gone" 404 — the daemon uses
+// that response to drop the stale runtime from its in-memory map and re-register,
+// so collapsing transient DB errors into the same 404 would force the daemon to
+// self-cleanup on a hiccup. Other DB errors become 500.
 func (h *Handler) requireDaemonRuntimeAccess(w http.ResponseWriter, r *http.Request, runtimeID string) (db.AgentRuntime, bool) {
 	runtimeUUID, ok := parseUUIDOrBadRequest(w, runtimeID, "runtime_id")
 	if !ok {
@@ -61,7 +76,12 @@ func (h *Handler) requireDaemonRuntimeAccess(w http.ResponseWriter, r *http.Requ
 	}
 	rt, err := h.Queries.GetAgentRuntime(r.Context(), runtimeUUID)
 	if err != nil {
-		writeError(w, http.StatusNotFound, "runtime not found")
+		if isNotFound(err) {
+			writeError(w, http.StatusNotFound, "runtime not found")
+			return db.AgentRuntime{}, false
+		}
+		slog.Warn("get agent runtime failed", "runtime_id", runtimeID, "error", err)
+		writeError(w, http.StatusInternalServerError, "failed to load runtime")
 		return db.AgentRuntime{}, false
 	}
 	if !h.requireDaemonWorkspaceAccess(w, r, uuidToString(rt.WorkspaceID)) {
@@ -115,8 +135,15 @@ func (h *Handler) verifyDaemonWorkspaceAccess(r *http.Request, workspaceID strin
 	if userID == "" {
 		return false
 	}
+	if h.MembershipCache.Get(r.Context(), userID, workspaceID) {
+		return true
+	}
 	_, err := h.getWorkspaceMember(r.Context(), userID, workspaceID)
-	return err == nil
+	if err != nil {
+		return false
+	}
+	h.MembershipCache.Set(r.Context(), userID, workspaceID)
+	return true
 }
 
 // ---------------------------------------------------------------------------
@@ -134,7 +161,16 @@ type DaemonRegisterRequest struct {
 	DeviceName      string   `json:"device_name"`
 	CLIVersion      string   `json:"cli_version"` // multica CLI version
 	LaunchedBy      string   `json:"launched_by"` // "desktop" when spawned by the Electron app
-	Runtimes        []struct {
+	// Timezone is the daemon host's IANA timezone (e.g. "Asia/Shanghai"),
+	// detected client-side from time.Local. The server stores it on each
+	// agent_runtime row created for this daemon so token-usage rollups
+	// bucket by the operator's local calendar day instead of UTC. Empty
+	// or invalid values fall back to "UTC". The value is set ONLY on
+	// first-time registration; once a user overrides the tz via the web
+	// UI, the upsert query preserves that override on subsequent
+	// daemon reconnects (see UpsertAgentRuntime in runtime.sql).
+	Timezone string `json:"timezone"`
+	Runtimes []struct {
 		Name    string `json:"name"`
 		Type    string `json:"type"`
 		Version string `json:"version"` // agent CLI version (claude/codex)
@@ -146,6 +182,24 @@ type daemonWorkspaceReposResponse struct {
 	WorkspaceID  string     `json:"workspace_id"`
 	Repos        []RepoData `json:"repos"`
 	ReposVersion string     `json:"repos_version"`
+}
+
+// normalizeRuntimeTimezone validates and normalizes the IANA timezone string
+// reported by a daemon during registration. The stored column is NOT NULL with
+// a 'UTC' default so any unparseable, blank, or trivially-invalid value is
+// quietly downgraded to "UTC" rather than rejected: a misconfigured daemon
+// host shouldn't take down registration just because its tz string is junk.
+// Real validation happens on the user-driven PATCH path where we surface the
+// error.
+func normalizeRuntimeTimezone(tz string) string {
+	tz = strings.TrimSpace(tz)
+	if tz == "" {
+		return "UTC"
+	}
+	if _, err := time.LoadLocation(tz); err != nil {
+		return "UTC"
+	}
+	return tz
 }
 
 func normalizeWorkspaceRepos(repos []RepoData) []RepoData {
@@ -296,8 +350,18 @@ func (h *Handler) DaemonRegister(w http.ResponseWriter, r *http.Request) {
 			DeviceInfo:  deviceInfo,
 			Metadata:    metadata,
 			OwnerID:     ownerID,
+			Timezone:    normalizeRuntimeTimezone(req.Timezone),
 		})
 		if err != nil {
+			h.Analytics.Capture(analytics.RuntimeFailed(
+				uuidToString(ownerID),
+				req.WorkspaceID,
+				req.DaemonID,
+				provider,
+				"registration_failed",
+				"db_error",
+				true,
+			))
 			writeError(w, http.StatusInternalServerError, "failed to register runtime: "+err.Error())
 			return
 		}
@@ -317,17 +381,31 @@ func (h *Handler) DaemonRegister(w http.ResponseWriter, r *http.Request) {
 			UpdatedAt:      row.UpdatedAt,
 			OwnerID:        row.OwnerID,
 			LegacyDaemonID: row.LegacyDaemonID,
+			Timezone:       row.Timezone,
 		}
 
+		// Inserted is false for normal daemon reconnects/upserts, so
+		// runtime_ready is a first-ready-per-runtime-row signal.
 		if row.Inserted {
 			h.Analytics.Capture(analytics.RuntimeRegistered(
 				uuidToString(ownerID),
 				req.WorkspaceID,
 				uuidToString(registered.ID),
+				req.DaemonID,
 				provider,
 				runtime.Version,
 				req.CLIVersion,
 			))
+			if registered.Status == "online" {
+				h.Analytics.Capture(analytics.RuntimeReady(
+					uuidToString(ownerID),
+					req.WorkspaceID,
+					uuidToString(registered.ID),
+					req.DaemonID,
+					provider,
+					0,
+				))
+			}
 		}
 
 		// Seamless migration from the previous hostname-derived identity. The
@@ -500,6 +578,13 @@ func (h *Handler) DaemonDeregister(w http.ResponseWriter, r *http.Request) {
 			slog.Warn("deregister: failed to set offline", "runtime_id", rid, "error", err)
 			continue
 		}
+		h.Analytics.Capture(analytics.RuntimeOffline(
+			uuidToString(rt.OwnerID),
+			wsID,
+			uuidToString(rt.ID),
+			rt.DaemonID.String,
+			rt.Provider,
+		))
 
 		affectedWorkspaces[wsID] = true
 	}
@@ -614,8 +699,18 @@ func (h *Handler) DaemonHeartbeat(w http.ResponseWriter, r *http.Request) {
 	rt, lookupErr := h.Queries.GetAgentRuntime(r.Context(), runtimeUUID)
 	runtimeLookupMs = time.Since(lookupStart).Milliseconds()
 	if lookupErr != nil {
-		outcome = "runtime_not_found"
-		writeError(w, http.StatusNotFound, "runtime not found")
+		// Only pgx.ErrNoRows means the runtime row is gone. Daemon reads this
+		// 404 as a signal to drop the stale runtime locally; treating a
+		// transient DB error the same way would force daemons to self-cleanup
+		// on a hiccup.
+		if isNotFound(lookupErr) {
+			outcome = "runtime_not_found"
+			writeError(w, http.StatusNotFound, "runtime not found")
+			return
+		}
+		outcome = "runtime_lookup_error"
+		slog.Warn("get agent runtime failed", "runtime_id", req.RuntimeID, "error", lookupErr)
+		writeError(w, http.StatusInternalServerError, "failed to load runtime")
 		return
 	}
 	wsCheckStart := time.Now()
@@ -671,6 +766,13 @@ func (h *Handler) DaemonHeartbeat(w http.ResponseWriter, r *http.Request) {
 // Workspace authorization is re-checked on every heartbeat instead of trusted
 // from the upgrade-time check because runtime ownership can change (e.g. a
 // runtime is reassigned to another workspace mid-connection).
+//
+// When the runtime row is missing (pgx.ErrNoRows), the function returns a
+// successful ack with Status=HeartbeatStatusRuntimeGone and RuntimeGone=true
+// instead of an error. That keeps the hub from logging every beat at Warn,
+// and tells the daemon to drop the stale runtime and re-register. Other DB
+// errors still propagate as errors so they keep their existing Warn logging
+// and the daemon does not mistake a hiccup for a deletion.
 func (h *Handler) HandleDaemonWSHeartbeat(ctx context.Context, identity daemonws.ClientIdentity, runtimeID string) (*protocol.DaemonHeartbeatAckPayload, error) {
 	runtimeUUID, err := util.ParseUUID(runtimeID)
 	if err != nil {
@@ -678,7 +780,14 @@ func (h *Handler) HandleDaemonWSHeartbeat(ctx context.Context, identity daemonws
 	}
 	rt, err := h.Queries.GetAgentRuntime(ctx, runtimeUUID)
 	if err != nil {
-		return nil, fmt.Errorf("runtime not found: %w", err)
+		if isNotFound(err) {
+			return &protocol.DaemonHeartbeatAckPayload{
+				RuntimeID:   runtimeID,
+				Status:      protocol.HeartbeatStatusRuntimeGone,
+				RuntimeGone: true,
+			}, nil
+		}
+		return nil, fmt.Errorf("get agent runtime: %w", err)
 	}
 	if identity.WorkspaceID != "" && identity.WorkspaceID != uuidToString(rt.WorkspaceID) {
 		return nil, fmt.Errorf("runtime not in connection workspace")
@@ -1015,6 +1124,36 @@ func (h *Handler) ClaimTaskByRuntime(w http.ResponseWriter, r *http.Request) {
 	if task.IssueID.Valid {
 		if issue, err := h.Queries.GetIssue(r.Context(), task.IssueID); err == nil {
 			resp.WorkspaceID = uuidToString(issue.WorkspaceID)
+			resp.IssueTitle = issue.Title
+			if issue.Description.Valid {
+				resp.IssueDescription = issue.Description.String
+			}
+
+			// Squad-leader briefing injection: when the issue is assigned
+			// to a squad and the claiming agent is that squad's current
+			// leader, append a full briefing (Operating Protocol + Roster
+			// + user Instructions) to the agent's own Instructions. We
+			// append (not replace) so per-agent instructions remain
+			// authoritative for general behavior; the squad briefing
+			// stacks on top as task-specific squad context.
+			if resp.Agent != nil && issue.AssigneeType.Valid && issue.AssigneeType.String == "squad" && issue.AssigneeID.Valid {
+				if squad, err := h.Queries.GetSquadInWorkspace(r.Context(), db.GetSquadInWorkspaceParams{
+					ID:          issue.AssigneeID,
+					WorkspaceID: issue.WorkspaceID,
+				}); err == nil && uuidToString(squad.LeaderID) == resp.Agent.ID {
+					briefing := buildSquadLeaderBriefing(r.Context(), h.Queries, squad)
+					if strings.TrimSpace(resp.Agent.Instructions) == "" {
+						resp.Agent.Instructions = briefing
+					} else {
+						resp.Agent.Instructions = resp.Agent.Instructions + "\n\n" + briefing
+					}
+					slog.Debug("injected squad leader briefing",
+						"squad_id", uuidToString(squad.ID),
+						"squad_name", squad.Name,
+						"leader_agent_id", resp.Agent.ID,
+					)
+				}
+			}
 
 			var projectRepos []RepoData
 			if issue.ProjectID.Valid {
@@ -1063,6 +1202,10 @@ func (h *Handler) ClaimTaskByRuntime(w http.ResponseWriter, r *http.Request) {
 					resp.Repos = repos
 				}
 			}
+
+			if urls, err := h.Queries.ListAttachmentURLsByIssueOrComments(r.Context(), task.IssueID); err == nil && len(urls) > 0 {
+				resp.HasIssueOrCommentAttachments = true
+			}
 		}
 
 		// Fetch the triggering comment content so the daemon can embed it
@@ -1097,16 +1240,21 @@ func (h *Handler) ClaimTaskByRuntime(w http.ResponseWriter, r *http.Request) {
 		// Look up the prior session for this (agent, issue) pair so the daemon
 		// can resume the Claude Code conversation context.
 		//
-		// Skip the lookup when the task was flagged as a manual rerun: the
-		// user just judged the prior output bad, so the daemon must start a
-		// fresh agent session instead of resuming the same conversation that
-		// produced that output.
+		// Skip all prior state when the task was flagged as a manual rerun:
+		// the user just judged the prior output bad, so the daemon must start a
+		// fresh agent session in a fresh workdir instead of resuming anything
+		// from the same conversation that produced that output. For
+		// comment-triggered follow-ups, skip only the session resume: resumed
+		// issue conversations often inherit the prior final assistant message
+		// (for example "Done.") and answer a new human comment with that stale
+		// completion marker instead of the comment itself. Keep reusing the
+		// workdir for comment follow-ups so the agent still sees the same checkout.
 		if !task.ForceFreshSession {
 			if prior, err := h.Queries.GetLastTaskSession(r.Context(), db.GetLastTaskSessionParams{
 				AgentID: task.AgentID,
 				IssueID: task.IssueID,
 			}); err == nil && prior.SessionID.Valid {
-				if prior.RuntimeID == task.RuntimeID {
+				if !task.TriggerCommentID.Valid && prior.RuntimeID == task.RuntimeID {
 					resp.PriorSessionID = prior.SessionID.String
 				}
 				if prior.WorkDir.Valid {
@@ -1149,12 +1297,29 @@ func (h *Handler) ClaimTaskByRuntime(w http.ResponseWriter, r *http.Request) {
 					resp.PriorWorkDir = prior.WorkDir.String
 				}
 			}
-			// Load the latest user message for the chat prompt.
+			// Load the latest user message for the chat prompt, plus any
+			// attachments linked to that exact message. Without the structured
+			// attachment list the agent only sees the markdown URL in
+			// `ChatMessage` — fine for vision models inline but unusable when
+			// the agent wants to `multica attachment download <id>` (URL is
+			// signed and 30-min expiring on private CDN).
 			if msgs, err := h.Queries.ListChatMessages(r.Context(), cs.ID); err == nil && len(msgs) > 0 {
-				// Find the last user message.
 				for i := len(msgs) - 1; i >= 0; i-- {
 					if msgs[i].Role == "user" {
 						resp.ChatMessage = msgs[i].Content
+						if atts, attErr := h.Queries.ListAttachmentsByChatMessage(r.Context(), db.ListAttachmentsByChatMessageParams{
+							ChatMessageID: msgs[i].ID,
+							WorkspaceID:   parseUUID(resp.WorkspaceID),
+						}); attErr == nil && len(atts) > 0 {
+							resp.ChatMessageAttachments = make([]ChatAttachmentMeta, len(atts))
+							for j, a := range atts {
+								resp.ChatMessageAttachments[j] = ChatAttachmentMeta{
+									ID:          uuidToString(a.ID),
+									Filename:    a.Filename,
+									ContentType: a.ContentType,
+								}
+							}
+						}
 						break
 					}
 				}
@@ -1202,10 +1367,91 @@ func (h *Handler) ClaimTaskByRuntime(w http.ResponseWriter, r *http.Request) {
 			hasQuickCreate = true
 			resp.QuickCreatePrompt = qc.Prompt
 			resp.WorkspaceID = qc.WorkspaceID
-			if ws, err := h.Queries.GetWorkspace(r.Context(), parseUUID(qc.WorkspaceID)); err == nil && ws.Repos != nil {
+
+			// When the user picked a project in the modal, surface its title
+			// and resources to the daemon so the agent has the same context
+			// it would for an issue-bound task: the prompt template can name
+			// the project, and `multica repo checkout` sees the project's
+			// github_repo resources instead of the workspace fallback.
+			var projectRepos []RepoData
+			if qc.ProjectID != "" {
+				projectUUID, err := util.ParseUUID(qc.ProjectID)
+				if err == nil {
+					resp.ProjectID = qc.ProjectID
+					if proj, err := h.Queries.GetProject(r.Context(), projectUUID); err == nil {
+						resp.ProjectTitle = proj.Title
+					}
+					if rows := h.listProjectResourcesForProject(r.Context(), projectUUID); len(rows) > 0 {
+						out := make([]ProjectResourceData, 0, len(rows))
+						for _, row := range rows {
+							label := ""
+							if row.Label.Valid {
+								label = row.Label.String
+							}
+							ref := json.RawMessage(row.ResourceRef)
+							if len(ref) == 0 {
+								ref = json.RawMessage("{}")
+							}
+							out = append(out, ProjectResourceData{
+								ID:           uuidToString(row.ID),
+								ResourceType: row.ResourceType,
+								ResourceRef:  ref,
+								Label:        label,
+							})
+							if row.ResourceType == "github_repo" {
+								var payload struct {
+									URL string `json:"url"`
+								}
+								if json.Unmarshal(row.ResourceRef, &payload) == nil && payload.URL != "" {
+									projectRepos = append(projectRepos, RepoData{URL: payload.URL})
+								}
+							}
+						}
+						resp.ProjectResources = out
+					}
+				}
+			}
+
+			if len(projectRepos) > 0 {
+				resp.Repos = projectRepos
+			} else if ws, err := h.Queries.GetWorkspace(r.Context(), parseUUID(qc.WorkspaceID)); err == nil && ws.Repos != nil {
 				var repos []RepoData
 				if json.Unmarshal(ws.Repos, &repos) == nil && len(repos) > 0 {
 					resp.Repos = repos
+				}
+			}
+
+			// Squad-leader briefing injection for quick-create tasks. When
+			// the user picked a squad in the modal, the task runs on the
+			// squad's leader agent (resolved by the handler). Surface the
+			// same Operating Protocol + Roster + user Instructions that
+			// issue-bound squad tasks see, so the leader can decide to
+			// delegate before opening the issue.
+			if resp.Agent != nil && qc.SquadID != "" {
+				wsUUID, wsErr := util.ParseUUID(qc.WorkspaceID)
+				squadUUID, sqErr := util.ParseUUID(qc.SquadID)
+				if wsErr == nil && sqErr == nil {
+					if squad, err := h.Queries.GetSquadInWorkspace(r.Context(), db.GetSquadInWorkspaceParams{
+						ID:          squadUUID,
+						WorkspaceID: wsUUID,
+					}); err == nil && uuidToString(squad.LeaderID) == resp.Agent.ID {
+						briefing := buildSquadLeaderBriefing(r.Context(), h.Queries, squad)
+						if strings.TrimSpace(resp.Agent.Instructions) == "" {
+							resp.Agent.Instructions = briefing
+						} else {
+							resp.Agent.Instructions = resp.Agent.Instructions + "\n\n" + briefing
+						}
+						// Surface the squad identity to the daemon so the
+						// quick-create prompt defaults the new issue's
+						// assignee to the squad, not the leader agent.
+						resp.SquadID = uuidToString(squad.ID)
+						resp.SquadName = squad.Name
+						slog.Debug("injected squad leader briefing for quick-create",
+							"squad_id", uuidToString(squad.ID),
+							"squad_name", squad.Name,
+							"leader_agent_id", resp.Agent.ID,
+						)
+					}
 				}
 			}
 		}
@@ -1379,6 +1625,7 @@ func (h *Handler) emitIssueExecutedOnFirstCompletion(r *http.Request, task *db.A
 	if task.StartedAt.Valid && task.CompletedAt.Valid {
 		durationMS = task.CompletedAt.Time.Sub(task.StartedAt.Time).Milliseconds()
 	}
+	taskContext := h.TaskService.AnalyticsContextForTask(r.Context(), *task)
 	// distinct_id prefers the human creator so agent-driven events flow into
 	// the issue-author's person profile (same place signup and
 	// workspace_created land). Agent-created issues keep the agent id with a
@@ -1391,6 +1638,11 @@ func (h *Handler) emitIssueExecutedOnFirstCompletion(r *http.Request, task *db.A
 		distinct,
 		uuidToString(marked.WorkspaceID),
 		uuidToString(marked.ID),
+		uuidToString(task.ID),
+		uuidToString(task.AgentID),
+		taskContext.Source,
+		taskContext.RuntimeMode,
+		taskContext.Provider,
 		durationMS,
 	))
 }

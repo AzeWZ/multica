@@ -43,6 +43,13 @@ interface AgentTranscriptDialogProps {
   items: TimelineItem[];
   agentName: string;
   isLive?: boolean;
+  /**
+   * Optional content rendered between the header chips and the event list.
+   * Used by autopilot run rows to surface the inbound webhook trigger
+   * payload so it's visible regardless of whether the agent echoes it.
+   * The dialog stays generic — slot content is the caller's concern.
+   */
+  headerSlot?: React.ReactNode;
 }
 
 // ─── Color mapping for timeline segments ────────────────────────────────────
@@ -96,7 +103,7 @@ function getEventLabel(item: TimelineItem): string {
 function getEventSummary(item: TimelineItem): string {
   switch (item.type) {
     case "text":
-      return item.content?.split("\n").filter(Boolean).pop() ?? "";
+      return item.content?.split("\n").find((l) => l.trim().length > 0) ?? "";
     case "thinking":
       return item.content?.slice(0, 200) ?? "";
     case "tool_use": {
@@ -162,6 +169,7 @@ export function AgentTranscriptDialog({
   items,
   agentName,
   isLive = false,
+  headerSlot,
 }: AgentTranscriptDialogProps) {
   const { t } = useT("agents");
   const [selectedSeq, setSelectedSeq] = useState<number | null>(null);
@@ -451,6 +459,13 @@ export function AgentTranscriptDialog({
           </div>
         )}
 
+        {/* ── Optional header slot (e.g. webhook payload preview) ── */}
+        {headerSlot && (
+          <div className="border-b px-4 py-3 shrink-0 bg-muted/20">
+            {headerSlot}
+          </div>
+        )}
+
         {/* ── Event list ─────────────────────────────────────────── */}
         <div
           ref={scrollContainerRef}
@@ -592,7 +607,7 @@ const TranscriptEventRow = ({
     (item.type === "tool_use" && item.input && Object.keys(item.input).length > 0) ||
     (item.type === "tool_result" && item.output && item.output.length > 0) ||
     (item.type === "thinking" && item.content && item.content.length > 0) ||
-    (item.type === "text" && item.content && item.content.split("\n").length > 1) ||
+    (item.type === "text" && item.content && item.content.length > 0) ||
     (item.type === "error" && item.content && item.content.length > 0);
 
   return (
