@@ -18,23 +18,25 @@ WHERE id = $1 AND workspace_id = $2;
 
 -- name: CreateAutopilot :one
 INSERT INTO autopilot (
-    workspace_id, title, description, assignee_id,
-    status, execution_mode, issue_title_template,
+    workspace_id, title, description, assignee_type, assignee_id,
+    status, execution_mode, issue_title_template, project_id,
     created_by_type, created_by_id
 ) VALUES (
-    $1, $2, sqlc.narg('description'), $3,
-    $4, $5, sqlc.narg('issue_title_template'),
-    $6, $7
+    $1, $2, sqlc.narg('description'), $3, $4,
+    $5, $6, sqlc.narg('issue_title_template'), sqlc.narg('project_id'),
+    $7, $8
 ) RETURNING *;
 
 -- name: UpdateAutopilot :one
 UPDATE autopilot SET
     title = COALESCE(sqlc.narg('title'), title),
     description = COALESCE(sqlc.narg('description'), description),
+    assignee_type = COALESCE(sqlc.narg('assignee_type'), assignee_type),
     assignee_id = COALESCE(sqlc.narg('assignee_id')::uuid, assignee_id),
     status = COALESCE(sqlc.narg('status'), status),
     execution_mode = COALESCE(sqlc.narg('execution_mode'), execution_mode),
     issue_title_template = sqlc.narg('issue_title_template'),
+    project_id = sqlc.narg('project_id'),
     updated_at = now()
 WHERE id = $1
 RETURNING *;
@@ -62,10 +64,12 @@ WHERE id = $1;
 -- name: CreateAutopilotTrigger :one
 INSERT INTO autopilot_trigger (
     autopilot_id, kind, enabled, cron_expression, timezone,
-    next_run_at, webhook_token, label
+    next_run_at, webhook_token, label, provider, event_filters
 ) VALUES (
     $1, $2, $3, sqlc.narg('cron_expression'), sqlc.narg('timezone'),
-    sqlc.narg('next_run_at'), sqlc.narg('webhook_token'), sqlc.narg('label')
+    sqlc.narg('next_run_at'), sqlc.narg('webhook_token'), sqlc.narg('label'),
+    COALESCE(sqlc.narg('provider')::text, 'generic'),
+    sqlc.narg('event_filters')
 ) RETURNING *;
 
 -- name: UpdateAutopilotTrigger :one
@@ -75,6 +79,7 @@ UPDATE autopilot_trigger SET
     timezone = COALESCE(sqlc.narg('timezone'), timezone),
     next_run_at = sqlc.narg('next_run_at'),
     label = COALESCE(sqlc.narg('label'), label),
+    event_filters = COALESCE(sqlc.narg('event_filters'), event_filters),
     updated_at = now()
 WHERE id = $1
 RETURNING *;
@@ -134,15 +139,33 @@ SET webhook_token = $2,
 WHERE id = $1
 RETURNING *;
 
+-- name: SetAutopilotTriggerSigningSecret :one
+-- Writes the signing secret for a webhook trigger. Kept as a dedicated query
+-- (not a field on UpdateAutopilotTrigger) so the request body for the
+-- write-only endpoint only ever carries the secret value, with no risk of an
+-- accidental log line leaking it alongside other fields. Restricted to
+-- webhook triggers to avoid corrupting unrelated state.
+UPDATE autopilot_trigger
+SET signing_secret = sqlc.narg('signing_secret'),
+    updated_at = now()
+WHERE id = $1
+  AND kind = 'webhook'
+RETURNING *;
+
 -- =====================
 -- Autopilot Run Management
 -- =====================
 
 -- name: CreateAutopilotRun :one
+-- squad_id is an attribution hook: set to the assignee squad when the
+-- parent autopilot has assignee_type='squad', NULL otherwise. The executing
+-- agent_id on agent_task_queue still records who actually ran the work
+-- (the squad leader); squad_id lets reports group by squad without a join.
 INSERT INTO autopilot_run (
-    autopilot_id, trigger_id, source, status, trigger_payload
+    autopilot_id, trigger_id, source, status, trigger_payload, squad_id
 ) VALUES (
-    $1, sqlc.narg('trigger_id'), $2, $3, sqlc.narg('trigger_payload')
+    $1, sqlc.narg('trigger_id'), $2, $3, sqlc.narg('trigger_payload'),
+    sqlc.narg('squad_id')
 ) RETURNING *;
 
 -- name: GetAutopilotRun :one

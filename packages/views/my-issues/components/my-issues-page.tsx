@@ -10,17 +10,18 @@ import { useAuthStore } from "@multica/core/auth";
 import { useCurrentWorkspace } from "@multica/core/paths";
 import { WorkspaceAvatar } from "../../workspace/workspace-avatar";
 import { useQuery } from "@tanstack/react-query";
-import { agentListOptions } from "@multica/core/workspace/queries";
 import { filterIssues } from "../../issues/utils/filter";
 import { BOARD_STATUSES } from "@multica/core/issues/config";
 import { ViewStoreProvider } from "@multica/core/issues/stores/view-store-context";
 import { useIssueSelectionStore } from "@multica/core/issues/stores/selection-store";
 import { BoardView } from "../../issues/components/board-view";
 import { ListView } from "../../issues/components/list-view";
+import { SwimLaneView } from "../../issues/components/swimlane-view";
 import { BatchActionToolbar } from "../../issues/components/batch-action-toolbar";
 import { useClearFiltersOnWorkspaceChange } from "@multica/core/issues/stores/view-store";
 import { useWorkspaceId } from "@multica/core/hooks";
 import { myIssueAssigneeGroupsOptions, myIssueListOptions, childIssueProgressOptions, type AssigneeGroupedIssuesFilter, type MyIssuesFilter } from "@multica/core/issues/queries";
+import { agentTaskSnapshotOptions } from "@multica/core/agents";
 import { useUpdateIssue } from "@multica/core/issues/mutations";
 import { myIssuesViewStore } from "@multica/core/issues/stores/my-issues-view-store";
 import { PageHeader } from "../../layout/page-header";
@@ -32,14 +33,35 @@ export function MyIssuesPage() {
   const user = useAuthStore((s) => s.user);
   const workspace = useCurrentWorkspace();
   const wsId = useWorkspaceId();
-  const { data: agents = [] } = useQuery(agentListOptions(wsId));
-
   const viewMode = useStore(myIssuesViewStore, (s) => s.viewMode);
   const statusFilters = useStore(myIssuesViewStore, (s) => s.statusFilters);
   const priorityFilters = useStore(myIssuesViewStore, (s) => s.priorityFilters);
   const scope = useStore(myIssuesViewStore, (s) => s.scope);
   const grouping = useStore(myIssuesViewStore, (s) => s.grouping);
+  const sortBy = useStore(myIssuesViewStore, (s) => s.sortBy);
+  const sortDirection = useStore(myIssuesViewStore, (s) => s.sortDirection);
+  const agentRunningFilter = useStore(myIssuesViewStore, (s) => s.agentRunningFilter);
   const usesAssigneeBoard = viewMode === "board" && grouping === "assignee";
+
+  const sort = useMemo(
+    () => ({
+      sort_by: sortBy,
+      sort_direction: sortBy !== "position" ? sortDirection : undefined,
+    } as const),
+    [sortBy, sortDirection],
+  );
+
+  // See issues-page.tsx for the rationale — derive a workspace-wide set
+  // of issue ids with at least one running task, drive the "agents
+  // working" quick-filter from it.
+  const { data: snapshot = [] } = useQuery(agentTaskSnapshotOptions(wsId));
+  const runningIssueIds = useMemo(() => {
+    const ids = new Set<string>();
+    for (const t of snapshot) {
+      if (t.status === "running" && t.issue_id) ids.add(t.issue_id);
+    }
+    return ids;
+  }, [snapshot]);
 
   // Clear filter state when switching between workspaces (URL-driven).
   useClearFiltersOnWorkspaceChange(myIssuesViewStore, wsId);
@@ -48,15 +70,11 @@ export function MyIssuesPage() {
     useIssueSelectionStore.getState().clear();
   }, [viewMode, scope]);
 
-  // Build server-side filter based on scope
-  const myAgentIds = useMemo(() => {
-    if (!user) return [] as string[];
-    return agents
-      .filter((a) => a.owner_id === user.id)
-      .map((a) => a.id)
-      .sort();
-  }, [agents, user]);
-
+  // Build server-side filter based on scope. The `agents` tab uses
+  // `involves_user_id` so the server expands the user's identity to all
+  // assignees that indirectly belong to them (owned agents + related squads).
+  // Direct member assignment is intentionally excluded — that is the
+  // `assigned` tab's semantics.
   const filter: MyIssuesFilter = useMemo(() => {
     if (!user) return {};
     switch (scope) {
@@ -65,11 +83,17 @@ export function MyIssuesPage() {
       case "created":
         return { creator_id: user.id };
       case "agents":
-        return { assignee_ids: myAgentIds };
+        return { involves_user_id: user.id };
+      case "all":
+        // "All" is the union of the three single-relation filters above;
+        // the per-relation user id is plumbed through `userId` to
+        // myIssue*Options. The filter object stays empty so it carries
+        // no narrowing of its own.
+        return {};
       default:
         return { assignee_id: user.id };
     }
-  }, [scope, user, myAgentIds]);
+  }, [scope, user]);
 
   const assigneeGroupFilter = useMemo<AssigneeGroupedIssuesFilter>(
     () => ({
@@ -83,9 +107,11 @@ export function MyIssuesPage() {
     wsId,
     scope,
     assigneeGroupFilter,
+    user?.id,
+    sort,
   );
   const statusIssuesQuery = useQuery({
-    ...myIssueListOptions(wsId, scope, filter),
+    ...myIssueListOptions(wsId, scope, filter, user?.id, sort),
     enabled: !usesAssigneeBoard,
   });
   const assigneeGroupsQuery = useQuery({
@@ -103,7 +129,7 @@ export function MyIssuesPage() {
     ? assigneeGroupsQuery.isLoading
     : statusIssuesQuery.isLoading;
 
-  // Apply status/priority filters from view store
+  // Apply status/priority/agent-running filters from view store
   const issues = useMemo(
     () =>
       filterIssues(myIssues, {
@@ -115,8 +141,28 @@ export function MyIssuesPage() {
         projectFilters: [],
         includeNoProject: false,
         labelFilters: [],
+        agentRunningFilter,
+        runningIssueIds,
       }),
-    [myIssues, statusFilters, priorityFilters],
+    [myIssues, statusFilters, priorityFilters, agentRunningFilter, runningIssueIds],
+  );
+
+  // Status-unfiltered companion for Swimlane.
+  const swimlaneIssues = useMemo(
+    () =>
+      filterIssues(myIssues, {
+        statusFilters: [],
+        priorityFilters,
+        assigneeFilters: [],
+        includeNoAssignee: false,
+        creatorFilters: [],
+        projectFilters: [],
+        includeNoProject: false,
+        labelFilters: [],
+        agentRunningFilter,
+        runningIssueIds,
+      }),
+    [myIssues, priorityFilters, agentRunningFilter, runningIssueIds],
   );
 
   const { data: childProgressMap = new Map() } = useQuery(childIssueProgressOptions(wsId));
@@ -133,7 +179,7 @@ export function MyIssuesPage() {
 
   const updateIssueMutation = useUpdateIssue();
   const handleMoveIssue = useCallback(
-    (issueId: string, updates: Pick<UpdateIssueRequest, "status" | "assignee_type" | "assignee_id" | "position">) => {
+    (issueId: string, updates: Pick<UpdateIssueRequest, "status" | "assignee_type" | "assignee_id" | "position" | "parent_issue_id">, onSettled?: () => void) => {
       updateIssueMutation.mutate(
         { id: issueId, ...updates },
         {
@@ -143,6 +189,7 @@ export function MyIssuesPage() {
                 ? err.message
                 : t(($) => $.errors.move_failed),
             ),
+          onSettled: () => onSettled?.(),
         },
       );
     },
@@ -169,7 +216,7 @@ export function MyIssuesPage() {
           </div>
         </div>
         {viewMode === "list" ? (
-          <div className="flex-1 min-h-0 overflow-y-auto p-2 space-y-1">
+          <div className="flex-1 min-h-0 overflow-y-auto p-2 pt-0 space-y-1">
             {Array.from({ length: 4 }).map((_, i) => (
               <Skeleton key={i} className="h-10 w-full rounded-lg" />
             ))}
@@ -201,11 +248,9 @@ export function MyIssuesPage() {
         <span className="text-sm font-medium">{t(($) => $.page.breadcrumb)}</span>
       </PageHeader>
 
-      {/* Header: scope tabs (left) + controls (right) */}
-      <MyIssuesHeader allIssues={myIssues} />
-
-      {/* Content: scrollable */}
       <ViewStoreProvider store={myIssuesViewStore}>
+        {/* Header: scope tabs (left) + controls (right) */}
+        <MyIssuesHeader allIssues={myIssues} />
         {myIssues.length === 0 ? (
           <div className="flex flex-1 min-h-0 flex-col items-center justify-center gap-2 text-muted-foreground">
             <ListTodo className="h-10 w-10 text-muted-foreground/40" />
@@ -226,6 +271,19 @@ export function MyIssuesPage() {
                 childProgressMap={childProgressMap}
                 myIssuesScope={scope}
                 myIssuesFilter={filter}
+                sort={sort}
+              />
+            ) : viewMode === "swimlane" ? (
+              <SwimLaneView
+                issues={issues}
+                unfilteredIssues={swimlaneIssues}
+                visibleStatuses={visibleStatuses}
+                hiddenStatuses={hiddenStatuses}
+                onMoveIssue={handleMoveIssue}
+                childProgressMap={childProgressMap}
+                myIssuesScope={scope}
+                myIssuesFilter={filter}
+                sort={sort}
               />
             ) : (
               <ListView
@@ -234,6 +292,8 @@ export function MyIssuesPage() {
                 childProgressMap={childProgressMap}
                 myIssuesScope={scope}
                 myIssuesFilter={filter}
+                sort={sort}
+                onMoveIssue={handleMoveIssue}
               />
             )}
           </div>

@@ -8,6 +8,7 @@ import {
 } from "lucide-react";
 import { useQuery } from "@tanstack/react-query";
 import { autopilotDetailOptions, autopilotRunsOptions, autopilotRunOptions } from "@multica/core/autopilots/queries";
+import { projectDetailOptions } from "@multica/core/projects/queries";
 import {
   useUpdateAutopilot,
   useDeleteAutopilot,
@@ -56,6 +57,8 @@ import { ReadonlyContent } from "../../editor";
 import { TranscriptButton } from "../../common/task-transcript";
 import { AutopilotDialog } from "./autopilot-dialog";
 import { WebhookPayloadPreview } from "./webhook-payload-preview";
+import { WebhookDeliveriesSection } from "./webhook-deliveries-section";
+import { ProjectIcon } from "../../projects/components/project-icon";
 import { useT } from "../../i18n";
 
 function formatDate(date: string): string {
@@ -313,6 +316,25 @@ function TriggerRow({ trigger, autopilotId }: { trigger: AutopilotTrigger; autop
   };
 
   const Icon = isWebhook ? Webhook : isApi ? Zap : Clock;
+  const showWebhookUrlRow = isWebhook && webhookUrl;
+
+  // Delete control extracted so a webhook trigger can render it inline
+  // with Copy / Rotate on the URL action row (where the other action
+  // buttons live), while schedule / api triggers — which have no URL row
+  // — keep it pinned to the row's top-right corner. Without this the
+  // trash icon visually floats above the URL action buttons because the
+  // outer flex uses `items-start`.
+  const deleteButton = (
+    <Button
+      size="icon"
+      variant="ghost"
+      className="h-7 w-7 shrink-0"
+      onClick={() => setConfirmOpen(true)}
+      title={t(($) => $.trigger_row.delete_dialog.confirm)}
+    >
+      <Trash2 className="h-3.5 w-3.5 text-muted-foreground" />
+    </Button>
+  );
 
   return (
     <div className="flex items-start gap-3 rounded-md border px-3 py-2">
@@ -345,7 +367,7 @@ function TriggerRow({ trigger, autopilotId }: { trigger: AutopilotTrigger; autop
             {t(($) => $.trigger_row.next_label, { date: formatDate(trigger.next_run_at) })}
           </div>
         )}
-        {isWebhook && webhookUrl && (
+        {showWebhookUrlRow && (
           <div className="mt-1.5 flex items-center gap-1.5">
             <code className="flex-1 min-w-0 truncate rounded bg-muted px-2 py-1 text-xs font-mono text-foreground">
               {webhookUrl}
@@ -369,17 +391,11 @@ function TriggerRow({ trigger, autopilotId }: { trigger: AutopilotTrigger; autop
             >
               <RotateCw className={cn("h-3.5 w-3.5 text-muted-foreground", rotateToken.isPending && "animate-spin")} />
             </Button>
+            {deleteButton}
           </div>
         )}
       </div>
-      <Button
-        size="icon"
-        variant="ghost"
-        className="h-7 w-7 shrink-0"
-        onClick={() => setConfirmOpen(true)}
-      >
-        <Trash2 className="h-3.5 w-3.5 text-muted-foreground" />
-      </Button>
+      {!showWebhookUrlRow && deleteButton}
       <AlertDialog open={confirmOpen} onOpenChange={(v) => { if (!v && !deleting) setConfirmOpen(false); }}>
         <AlertDialogContent>
           <AlertDialogHeader>
@@ -569,6 +585,11 @@ export function AutopilotDetailPage({ autopilotId }: { autopilotId: string }) {
   const updateAutopilot = useUpdateAutopilot();
   const deleteAutopilot = useDeleteAutopilot();
   const triggerAutopilot = useTriggerAutopilot();
+  const projectId = data?.autopilot.project_id ?? null;
+  const { data: project, isLoading: projectLoading } = useQuery({
+    ...projectDetailOptions(wsId, projectId ?? ""),
+    enabled: Boolean(projectId),
+  });
 
   const [triggerDialogOpen, setTriggerDialogOpen] = useState(false);
   const [editDialogOpen, setEditDialogOpen] = useState(false);
@@ -710,8 +731,16 @@ export function AutopilotDetailPage({ autopilotId }: { autopilotId: string }) {
               <div>
                 <label className="text-xs text-muted-foreground">{t(($) => $.detail.field_agent)}</label>
                 <div className="mt-1 flex items-center gap-2">
-                  <ActorAvatar actorType="agent" actorId={autopilot.assignee_id} size={20} enableHoverCard showStatusDot />
-                  <span className="cursor-pointer">{getActorName("agent", autopilot.assignee_id)}</span>
+                  <ActorAvatar
+                    actorType={autopilot.assignee_type}
+                    actorId={autopilot.assignee_id}
+                    size={20}
+                    enableHoverCard={autopilot.assignee_type === "agent"}
+                    showStatusDot={autopilot.assignee_type === "agent"}
+                  />
+                  <span className="cursor-pointer">
+                    {getActorName(autopilot.assignee_type, autopilot.assignee_id)}
+                  </span>
                 </div>
               </div>
               <div>
@@ -720,6 +749,28 @@ export function AutopilotDetailPage({ autopilotId }: { autopilotId: string }) {
                   {t(($) => $.execution_mode[autopilot.execution_mode as AutopilotExecutionMode])}
                 </div>
               </div>
+              {autopilot.execution_mode === "create_issue" && (
+                <div>
+                  <label className="text-xs text-muted-foreground">{t(($) => $.detail.field_project)}</label>
+                  <div className="mt-1 min-w-0">
+                    {!autopilot.project_id ? (
+                      <span className="text-muted-foreground">{t(($) => $.detail.no_project)}</span>
+                    ) : projectLoading ? (
+                      <Skeleton className="h-5 w-32" />
+                    ) : project ? (
+                      <AppLink
+                        href={wsPaths.projectDetail(project.id)}
+                        className="inline-flex max-w-full items-center gap-1.5 text-foreground hover:underline"
+                      >
+                        <ProjectIcon project={project} size="md" />
+                        <span className="truncate">{project.title}</span>
+                      </AppLink>
+                    ) : (
+                      <span className="text-muted-foreground">{t(($) => $.detail.project_unavailable)}</span>
+                    )}
+                  </div>
+                </div>
+              )}
               {autopilot.description && (
                 <div className="col-span-2">
                   <label className="text-xs text-muted-foreground">{t(($) => $.detail.field_prompt)}</label>
@@ -755,6 +806,14 @@ export function AutopilotDetailPage({ autopilotId }: { autopilotId: string }) {
             )}
           </section>
 
+          {/* Webhook deliveries — only renders when at least one webhook
+              trigger is configured. The component does its own fetch so
+              schedule-only autopilots don't pay for an empty list query. */}
+          <WebhookDeliveriesSection
+            autopilotId={autopilotId}
+            hasWebhookTrigger={triggers.some((trig) => trig.kind === "webhook")}
+          />
+
           {/* Run History */}
           <section className="space-y-3">
             <h2 className="text-sm font-medium text-muted-foreground uppercase tracking-wider">
@@ -774,7 +833,7 @@ export function AutopilotDetailPage({ autopilotId }: { autopilotId: string }) {
               <RunHistoryList
                 runs={runs}
                 agentId={autopilot.assignee_id}
-                agentName={getActorName("agent", autopilot.assignee_id)}
+                agentName={getActorName(autopilot.assignee_type, autopilot.assignee_id)}
               />
             )}
           </section>
@@ -806,6 +865,8 @@ export function AutopilotDetailPage({ autopilotId }: { autopilotId: string }) {
           initial={{
             title: autopilot.title,
             description: autopilot.description ?? "",
+            project_id: autopilot.project_id ?? null,
+            assignee_type: autopilot.assignee_type,
             assignee_id: autopilot.assignee_id,
             execution_mode: autopilot.execution_mode as AutopilotExecutionMode,
           }}

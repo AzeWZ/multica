@@ -10,6 +10,7 @@ import {
   Clock,
   Copy,
   FilePlus2,
+  FolderKanban,
   Maximize2,
   Minimize2,
   Play,
@@ -37,7 +38,8 @@ import { TimeInput } from "@multica/ui/components/ui/time-input";
 import { TimezonePicker } from "./pickers/timezone-picker";
 import { useCurrentWorkspace } from "@multica/core/paths";
 import { useWorkspaceId } from "@multica/core/hooks";
-import { agentListOptions } from "@multica/core/workspace/queries";
+import { agentListOptions, squadListOptions } from "@multica/core/workspace/queries";
+import { projectListOptions } from "@multica/core/projects/queries";
 import {
   useCreateAutopilot,
   useCreateAutopilotTrigger,
@@ -47,12 +49,15 @@ import {
 import { buildAutopilotWebhookUrl } from "@multica/core/autopilots";
 import { api } from "@multica/core/api";
 import type {
+  AutopilotAssigneeType,
   AutopilotExecutionMode,
   AutopilotTrigger,
 } from "@multica/core/types";
 import { TitleEditor, ContentEditor } from "../../editor";
 import { ActorAvatar } from "../../common/actor-avatar";
-import { AgentPicker } from "./pickers/agent-picker";
+import { ProjectPicker } from "../../projects/components/project-picker";
+import { ProjectIcon } from "../../projects/components/project-icon";
+import { AgentPicker, type AssigneeSelection } from "./pickers/agent-picker";
 import {
   getDefaultTriggerConfig,
   getLocalTimezone,
@@ -61,8 +66,10 @@ import {
   type TriggerConfig,
   type TriggerFrequency,
 } from "./trigger-config";
+import { WebhookEventFilterSection } from "./webhook-event-filter-section";
 import { useT } from "../../i18n";
 import { formatSchedulePartialFailureToast } from "./autopilot-dialog-toast";
+import type { WebhookEventFilter } from "@multica/core/types";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -71,6 +78,8 @@ import { formatSchedulePartialFailureToast } from "./autopilot-dialog-toast";
 export interface AutopilotInitial {
   title: string;
   description: string;
+  project_id: string | null;
+  assignee_type: AutopilotAssigneeType;
   assignee_id: string;
   execution_mode: AutopilotExecutionMode;
 }
@@ -220,6 +229,20 @@ function formatNextRunAbsolute(date: Date, timezone: string): string {
 }
 
 // ---------------------------------------------------------------------------
+// Webhook event-filter dirty detection
+// ---------------------------------------------------------------------------
+
+// serializeEventFilters returns a stable JSON string so the edit-mode dirty
+// check can compare the current filters against the snapshot taken on open
+// without depending on reference equality. Normalizes empty Actions to []
+// so omitted-vs-explicit-empty doesn't show as a phantom change.
+function serializeEventFilters(filters: WebhookEventFilter[]): string {
+  return JSON.stringify(
+    filters.map((f) => ({ event: f.event, actions: f.actions ?? [] })),
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Live "now" ticker for countdown
 // ---------------------------------------------------------------------------
 
@@ -242,6 +265,8 @@ export function AutopilotDialog(props: AutopilotDialogProps) {
   const workspaceName = useCurrentWorkspace()?.name;
   const wsId = useWorkspaceId();
   const { data: agents = [] } = useQuery(agentListOptions(wsId));
+  const { data: squads = [] } = useQuery(squadListOptions(wsId));
+  const { data: projects = [] } = useQuery(projectListOptions(wsId));
   const [isExpanded, setIsExpanded] = useState(false);
 
   const isCreate = props.mode === "create";
@@ -251,6 +276,10 @@ export function AutopilotDialog(props: AutopilotDialogProps) {
 
   const [title, setTitle] = useState(initial.title ?? "");
   const [description, setDescription] = useState(initial.description ?? "");
+  const [projectId, setProjectId] = useState<string | null>(initial.project_id ?? null);
+  const [assigneeType, setAssigneeType] = useState<AutopilotAssigneeType>(
+    initial.assignee_type ?? "agent",
+  );
   const [assigneeId, setAssigneeId] = useState<string>(initial.assignee_id ?? "");
   const [executionMode, setExecutionMode] = useState<AutopilotExecutionMode>(
     initial.execution_mode ?? "create_issue",
@@ -283,11 +312,18 @@ export function AutopilotDialog(props: AutopilotDialogProps) {
   })();
   const [triggerKind, setTriggerKind] = useState<"schedule" | "webhook">(initialKind);
 
+  const initialEventFilters: WebhookEventFilter[] =
+    !isCreate && props.triggers[0]?.event_filters ? props.triggers[0].event_filters : [];
+  const [eventFilters, setEventFilters] = useState<WebhookEventFilter[]>(initialEventFilters);
+
   const initialCronRef = useRef(toCronExpression(initialCfg));
   const initialTimezoneRef = useRef(initialCfg.timezone);
+  const initialEventFiltersRef = useRef(serializeEventFilters(initialEventFilters));
   const scheduleDirty =
     toCronExpression(triggerConfig) !== initialCronRef.current ||
     triggerConfig.timezone !== initialTimezoneRef.current;
+  const eventFiltersDirty =
+    serializeEventFilters(eventFilters) !== initialEventFiltersRef.current;
 
   const firstTriggerIdRef = useRef(
     !isCreate && props.triggers[0] ? props.triggers[0].id : null,
@@ -296,10 +332,24 @@ export function AutopilotDialog(props: AutopilotDialogProps) {
   const triggerCount = isCreate ? 0 : props.triggers.length;
   const schedulePillDisabled = !isCreate && triggerCount >= 2;
 
-  const selectedAgent = useMemo(
-    () => agents.find((a) => a.id === assigneeId) ?? null,
-    [agents, assigneeId],
+  const selectedAssignee = useMemo(() => {
+    if (!assigneeId) return null;
+    if (assigneeType === "squad") {
+      const squad = squads.find((s) => s.id === assigneeId);
+      return squad ? { name: squad.name, description: squad.description } : null;
+    }
+    const agent = agents.find((a) => a.id === assigneeId);
+    return agent ? { name: agent.name, description: agent.description } : null;
+  }, [agents, squads, assigneeId, assigneeType]);
+  const selectedProject = useMemo(
+    () => projects.find((project) => project.id === projectId) ?? null,
+    [projects, projectId],
   );
+
+  const handleAssigneeChange = (next: AssigneeSelection) => {
+    setAssigneeType(next.type);
+    setAssigneeId(next.id);
+  };
 
   const createAutopilot = useCreateAutopilot();
   const createTrigger = useCreateAutopilotTrigger();
@@ -324,6 +374,8 @@ export function AutopilotDialog(props: AutopilotDialogProps) {
         const autopilot = await createAutopilot.mutateAsync({
           title: title.trim(),
           description: description.trim() || undefined,
+          project_id: executionMode === "create_issue" ? projectId : null,
+          assignee_type: assigneeType,
           assignee_id: assigneeId,
           execution_mode: executionMode,
         });
@@ -335,6 +387,7 @@ export function AutopilotDialog(props: AutopilotDialogProps) {
             webhookTrigger = await createTrigger.mutateAsync({
               autopilotId: autopilot.id,
               kind: "webhook",
+              event_filters: eventFilters.length > 0 ? eventFilters : undefined,
             });
           } else {
             await createTrigger.mutateAsync({
@@ -370,11 +423,13 @@ export function AutopilotDialog(props: AutopilotDialogProps) {
           id: props.autopilotId,
           title: title.trim(),
           description: description.trim() || null,
+          project_id: executionMode === "create_issue" ? projectId : null,
+          assignee_type: assigneeType,
           assignee_id: assigneeId,
           execution_mode: executionMode,
         });
-        let scheduleOk = true;
-        let scheduleErrMessage: string | null = null;
+        let triggerOk = true;
+        let triggerErrMessage: string | null = null;
         // Skip the schedule sync when the autopilot's first trigger is a
         // webhook — there's no cron to update there, and the schedule
         // panel isn't even rendered for webhook autopilots.
@@ -397,16 +452,38 @@ export function AutopilotDialog(props: AutopilotDialogProps) {
               });
             }
           } catch (err) {
-            scheduleOk = false;
-            scheduleErrMessage =
+            triggerOk = false;
+            triggerErrMessage =
+              err instanceof Error && err.message ? err.message : null;
+          }
+        }
+        // Webhook autopilots have no schedule, but the user can still edit
+        // event_filters from the same dialog. PATCH only when the snapshot
+        // taken on open differs from the live state. Sending an explicit
+        // empty array clears filters server-side (tri-state semantics — see
+        // UpdateAutopilotTriggerRequest in autopilot.go).
+        if (
+          triggerKind === "webhook" &&
+          eventFiltersDirty &&
+          firstTriggerIdRef.current
+        ) {
+          try {
+            await updateTrigger.mutateAsync({
+              autopilotId: props.autopilotId,
+              triggerId: firstTriggerIdRef.current,
+              event_filters: eventFilters,
+            });
+          } catch (err) {
+            triggerOk = false;
+            triggerErrMessage =
               err instanceof Error && err.message ? err.message : null;
           }
         }
         onOpenChange(false);
-        if (scheduleOk) {
+        if (triggerOk) {
           toast.success(t(($) => $.dialog.toast_updated));
         } else {
-          toast.error(formatSchedulePartialFailureToast(t, "update", scheduleErrMessage));
+          toast.error(formatSchedulePartialFailureToast(t, "update", triggerErrMessage));
         }
       }
     } catch (err) {
@@ -468,6 +545,7 @@ export function AutopilotDialog(props: AutopilotDialogProps) {
               <TooltipTrigger
                 render={
                   <button
+                    type="button"
                     onClick={() => setIsExpanded((v) => !v)}
                     className="rounded-sm p-1.5 opacity-70 hover:opacity-100 hover:bg-accent/60 transition-all cursor-pointer"
                   >
@@ -483,6 +561,7 @@ export function AutopilotDialog(props: AutopilotDialogProps) {
               <TooltipTrigger
                 render={
                   <button
+                    type="button"
                     onClick={() => onOpenChange(false)}
                     className="rounded-sm p-1.5 opacity-70 hover:opacity-100 hover:bg-accent/60 transition-all cursor-pointer"
                   >
@@ -548,13 +627,22 @@ export function AutopilotDialog(props: AutopilotDialogProps) {
           {/* Right: Configuration */}
           <aside className="w-full lg:w-[340px] shrink-0 overflow-y-auto px-5 py-5 space-y-5 bg-muted/30">
             <AgentSection
+              selectedType={assigneeType}
               selectedId={assigneeId}
-              onChange={setAssigneeId}
-              selectedName={selectedAgent?.name}
-              selectedDescription={selectedAgent?.description}
+              onChange={handleAssigneeChange}
+              selectedName={selectedAssignee?.name}
+              selectedDescription={selectedAssignee?.description}
             />
 
             <OutputModeSection mode={executionMode} onChange={setExecutionMode} />
+
+            {executionMode === "create_issue" && (
+              <ProjectSection
+                projectId={projectId}
+                selectedProject={selectedProject}
+                onChange={setProjectId}
+              />
+            )}
 
             {isCreate && (
               <TriggerKindSection kind={triggerKind} onChange={setTriggerKind} />
@@ -572,7 +660,11 @@ export function AutopilotDialog(props: AutopilotDialogProps) {
                 }
               />
             ) : (
-              <WebhookHelpSection isCreate={isCreate} />
+              <WebhookSection
+                isCreate={isCreate}
+                eventFilters={eventFilters}
+                onEventFiltersChange={setEventFilters}
+              />
             )}
           </aside>
         </div>
@@ -618,22 +710,25 @@ function SectionLabel({ children }: { children: React.ReactNode }) {
 }
 
 function AgentSection({
+  selectedType,
   selectedId,
   onChange,
   selectedName,
   selectedDescription,
 }: {
+  selectedType: AutopilotAssigneeType;
   selectedId: string;
-  onChange: (id: string) => void;
+  onChange: (next: AssigneeSelection) => void;
   selectedName?: string;
   selectedDescription?: string;
 }) {
   const { t } = useT("autopilots");
+  const hasSelection = selectedId.length > 0;
   return (
     <div>
-      <SectionLabel>{t(($) => $.dialog.section_agent)}</SectionLabel>
+      <SectionLabel>{t(($) => $.dialog.section_assignee)}</SectionLabel>
       <AgentPicker
-        agentId={selectedId || null}
+        assignee={hasSelection ? { type: selectedType, id: selectedId } : null}
         onChange={onChange}
         align="start"
         triggerRender={
@@ -644,12 +739,12 @@ function AgentSection({
               "hover:bg-accent/40 transition-colors cursor-pointer",
             )}
           >
-            {selectedId ? (
+            {hasSelection ? (
               <ActorAvatar
-                actorType="agent"
+                actorType={selectedType}
                 actorId={selectedId}
                 size={28}
-                showStatusDot
+                showStatusDot={selectedType === "agent"}
               />
             ) : (
               <span className="inline-flex size-7 items-center justify-center rounded-full bg-muted text-muted-foreground">
@@ -658,7 +753,7 @@ function AgentSection({
             )}
             <span className="flex-1 min-w-0">
               <span className="block text-sm font-medium truncate">
-                {selectedName ?? t(($) => $.dialog.select_agent)}
+                {selectedName ?? t(($) => $.dialog.select_assignee)}
               </span>
               {selectedDescription && (
                 <span className="block text-xs text-muted-foreground truncate">
@@ -727,6 +822,49 @@ function OutputModeSection({
           );
         })}
       </div>
+    </div>
+  );
+}
+
+function ProjectSection({
+  projectId,
+  selectedProject,
+  onChange,
+}: {
+  projectId: string | null;
+  selectedProject: { title: string; icon: string | null } | null;
+  onChange: (projectId: string | null) => void;
+}) {
+  const { t } = useT("autopilots");
+  return (
+    <div>
+      <SectionLabel>{t(($) => $.dialog.section_project)}</SectionLabel>
+      <ProjectPicker
+        projectId={projectId}
+        onUpdate={(updates) => onChange(updates.project_id ?? null)}
+        align="start"
+        triggerRender={
+          <button
+            type="button"
+            className={cn(
+              "w-full flex items-center gap-2.5 rounded-md border bg-background px-3 py-2 text-left",
+              "hover:bg-accent/40 transition-colors cursor-pointer",
+            )}
+          >
+            {selectedProject ? (
+              <ProjectIcon project={selectedProject} size="md" />
+            ) : (
+              <span className="inline-flex size-5 items-center justify-center rounded-md bg-muted text-muted-foreground">
+                <FolderKanban className="size-3.5" />
+              </span>
+            )}
+            <span className="flex-1 min-w-0 truncate text-sm font-medium">
+              {selectedProject?.title ?? t(($) => $.dialog.no_project)}
+            </span>
+            <ChevronDown className="size-3.5 text-muted-foreground shrink-0" />
+          </button>
+        }
+      />
     </div>
   );
 }
@@ -922,16 +1060,30 @@ function TriggerKindButton({
   );
 }
 
-function WebhookHelpSection({ isCreate }: { isCreate: boolean }) {
+function WebhookSection({
+  isCreate,
+  eventFilters,
+  onEventFiltersChange,
+}: {
+  isCreate: boolean;
+  eventFilters: WebhookEventFilter[];
+  onEventFiltersChange: (filters: WebhookEventFilter[]) => void;
+}) {
   const { t } = useT("autopilots");
   return (
-    <div>
-      <SectionLabel>{t(($) => $.dialog.section_webhook)}</SectionLabel>
-      <p className="rounded-md border bg-background px-3 py-2 text-xs text-muted-foreground leading-relaxed">
-        {isCreate
-          ? t(($) => $.dialog.webhook_help_create)
-          : t(($) => $.dialog.webhook_help_edit)}
-      </p>
+    <div className="space-y-3">
+      <div>
+        <SectionLabel>{t(($) => $.dialog.section_webhook)}</SectionLabel>
+        <p className="rounded-md border bg-background px-3 py-2 text-xs text-muted-foreground leading-relaxed">
+          {isCreate
+            ? t(($) => $.dialog.webhook_help_create)
+            : t(($) => $.dialog.webhook_help_edit)}
+        </p>
+      </div>
+      <WebhookEventFilterSection
+        filters={eventFilters}
+        onChange={onEventFiltersChange}
+      />
     </div>
   );
 }

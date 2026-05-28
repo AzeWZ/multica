@@ -1318,25 +1318,55 @@ func TestExecuteAndDrain_IdleWatchdog_FiresAfterToolResultIfBackendStaysSilent(t
 	}
 }
 
-func TestEnsureRepoReadyFastPathDoesNotRefresh(t *testing.T) {
+// ensureRepoReady must refresh `workspaceState.settings` on every checkout —
+// even when the repo cache already holds the URL. The /repo/checkout handler
+// reads `workspaceCoAuthoredByEnabled` right after, and the 30s workspace
+// sync tick is too slow to make a freshly-flipped GitHub toggle feel live.
+// PR #2847 review by Emacs caught this fast-path regression; the test
+// asserts the cached-repo path still issues exactly one refresh.
+func TestEnsureRepoReadyCachedRepoStillRefreshesSettings(t *testing.T) {
 	t.Parallel()
 
 	sourceRepo := createDaemonTestRepo(t)
 	var refreshCalls atomic.Int32
 	d := newRepoReadyTestDaemon(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/api/daemon/workspaces/ws-1/repos" {
+			http.NotFound(w, r)
+			return
+		}
 		refreshCalls.Add(1)
-		http.Error(w, "unexpected refresh", http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(WorkspaceReposResponse{
+			WorkspaceID:  "ws-1",
+			Repos:        []RepoData{{URL: sourceRepo}},
+			ReposVersion: "v2",
+			Settings:     json.RawMessage(`{"github_enabled":false,"co_authored_by_enabled":true}`),
+		})
 	})
 	if err := d.repoCache.Sync("ws-1", []repocache.RepoInfo{{URL: sourceRepo}}); err != nil {
 		t.Fatalf("seed repo cache: %v", err)
 	}
-	d.workspaces["ws-1"] = newWorkspaceState("ws-1", nil, "v1", []RepoData{{URL: sourceRepo}}, nil)
+	// Workspace starts with the master switch ON. The server above will return
+	// the user's just-flipped OFF state — ensureRepoReady must pick that up
+	// before the handler reads workspaceCoAuthoredByEnabled.
+	d.workspaces["ws-1"] = newWorkspaceState(
+		"ws-1",
+		nil,
+		"v1",
+		[]RepoData{{URL: sourceRepo}},
+		json.RawMessage(`{"github_enabled":true,"co_authored_by_enabled":true}`),
+	)
+	if !d.workspaceCoAuthoredByEnabled("ws-1") {
+		t.Fatalf("precondition: expected co-author hook enabled before checkout")
+	}
 
 	if err := d.ensureRepoReady(context.Background(), "ws-1", sourceRepo); err != nil {
 		t.Fatalf("ensureRepoReady: %v", err)
 	}
-	if got := refreshCalls.Load(); got != 0 {
-		t.Fatalf("expected no refresh calls, got %d", got)
+	if got := refreshCalls.Load(); got != 1 {
+		t.Fatalf("expected exactly 1 refresh call on cached repo, got %d", got)
+	}
+	if d.workspaceCoAuthoredByEnabled("ws-1") {
+		t.Fatalf("expected co-author hook disabled after server-side toggle; daemon used stale workspaceState.settings via cache fast path")
 	}
 }
 
@@ -1346,20 +1376,29 @@ func TestEnsureRepoReadyTrimsURL(t *testing.T) {
 	sourceRepo := createDaemonTestRepo(t)
 	var refreshCalls atomic.Int32
 	d := newRepoReadyTestDaemon(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/api/daemon/workspaces/ws-1/repos" {
+			http.NotFound(w, r)
+			return
+		}
 		refreshCalls.Add(1)
-		http.Error(w, "unexpected refresh", http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(WorkspaceReposResponse{
+			WorkspaceID:  "ws-1",
+			Repos:        []RepoData{{URL: sourceRepo}},
+			ReposVersion: "v2",
+		})
 	})
 	if err := d.repoCache.Sync("ws-1", []repocache.RepoInfo{{URL: sourceRepo}}); err != nil {
 		t.Fatalf("seed repo cache: %v", err)
 	}
 	d.workspaces["ws-1"] = newWorkspaceState("ws-1", nil, "v1", []RepoData{{URL: sourceRepo}}, nil)
 
-	// URL with trailing whitespace should still hit the fast path.
+	// URL with trailing whitespace should still resolve to the cached repo.
 	if err := d.ensureRepoReady(context.Background(), "ws-1", "  "+sourceRepo+"  "); err != nil {
 		t.Fatalf("ensureRepoReady with padded URL: %v", err)
 	}
-	if got := refreshCalls.Load(); got != 0 {
-		t.Fatalf("expected no refresh calls for trimmed URL, got %d", got)
+	// Even on cache hit we refresh settings once so toggle flips feel live.
+	if got := refreshCalls.Load(); got != 1 {
+		t.Fatalf("expected 1 refresh call for trimmed URL, got %d", got)
 	}
 }
 
@@ -1438,8 +1477,12 @@ func TestRegisterTaskReposAllowsProjectOnlyURL(t *testing.T) {
 	if err := d.ensureRepoReady(context.Background(), "ws-1", sourceRepo); err != nil {
 		t.Fatalf("ensureRepoReady: %v", err)
 	}
-	if got := refreshCalls.Load(); got != 0 {
-		t.Fatalf("expected zero workspace-repos refreshes (URL came from project), got %d", got)
+	// ensureRepoReady refreshes settings on every call (RFC MUL-2414 §4.8; PR
+	// #2847 review by Emacs) so a freshly-flipped GitHub toggle takes effect
+	// without waiting for the 30s sync tick. We expect exactly one refresh —
+	// the project-only URL still skips re-cloning because the cache is warm.
+	if got := refreshCalls.Load(); got != 1 {
+		t.Fatalf("expected 1 workspace-repos refresh (settings live-refresh on checkout), got %d", got)
 	}
 }
 
@@ -1735,6 +1778,123 @@ func TestReportTaskResult_NonCompletedHitsFailEndpoint(t *testing.T) {
 				t.Errorf("session_id should be forwarded on failure paths so chat resume keeps working, got %v", rec.payload["session_id"])
 			}
 		})
+	}
+}
+
+// Regression test for the MUL-2780 incident: a short 502 burst on the
+// /complete callback used to (a) drop the task at the first failure and
+// (b) wrongly fall back to /fail, surfacing a successful run as red.
+// With the retry helper in place, a transient 502 followed by a 200 must
+// resolve via /complete without ever touching /fail.
+func TestReportTaskResult_RetriesTransientCompleteThenSucceeds(t *testing.T) {
+	defer noSleepRetry(t)()
+
+	var completeCalls, failCalls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		switch {
+		case strings.HasSuffix(req.URL.Path, "/complete"):
+			n := completeCalls.Add(1)
+			if n == 1 {
+				w.WriteHeader(http.StatusBadGateway)
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+		case strings.HasSuffix(req.URL.Path, "/fail"):
+			failCalls.Add(1)
+			w.WriteHeader(http.StatusOK)
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	d := &Daemon{client: NewClient(srv.URL), logger: slog.Default()}
+	d.reportTaskResult(context.Background(), "task-retry", TaskResult{
+		Status:  "completed",
+		Comment: "ok",
+	}, slog.Default())
+
+	if got := completeCalls.Load(); got != 2 {
+		t.Fatalf("expected 2 complete attempts (one 502, one 200), got %d", got)
+	}
+	if got := failCalls.Load(); got != 0 {
+		t.Fatalf("transient 502 must not fall back to /fail (would lose successful result), got %d /fail calls", got)
+	}
+}
+
+// Pins the new "don't downgrade success to failure on transient errors"
+// rule: when /complete is 502 across the entire retry schedule, we must
+// NOT fall through to /fail — that would surface a real success as a
+// failure in the UI. The task is left in running for a future recovery
+// path to pick up.
+func TestReportTaskResult_TransientCompleteExhaustedDoesNotFallback(t *testing.T) {
+	defer noSleepRetry(t)()
+
+	prevSchedule := defaultTerminalRetrySchedule
+	defaultTerminalRetrySchedule = []time.Duration{time.Nanosecond, time.Nanosecond}
+	t.Cleanup(func() { defaultTerminalRetrySchedule = prevSchedule })
+
+	var completeCalls, failCalls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		switch {
+		case strings.HasSuffix(req.URL.Path, "/complete"):
+			completeCalls.Add(1)
+			w.WriteHeader(http.StatusBadGateway)
+		case strings.HasSuffix(req.URL.Path, "/fail"):
+			failCalls.Add(1)
+			w.WriteHeader(http.StatusOK)
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	d := &Daemon{client: NewClient(srv.URL), logger: slog.Default()}
+	d.reportTaskResult(context.Background(), "task-stuck", TaskResult{
+		Status:  "completed",
+		Comment: "ok",
+	}, slog.Default())
+
+	if got := completeCalls.Load(); got != int32(len(defaultTerminalRetrySchedule)+1) {
+		t.Fatalf("expected %d complete attempts, got %d", len(defaultTerminalRetrySchedule)+1, got)
+	}
+	if got := failCalls.Load(); got != 0 {
+		t.Fatalf("exhausted transient retries must NOT fall back to /fail; got %d /fail calls", got)
+	}
+}
+
+// On permanent 4xx from /complete (e.g. 400 bad body, 404 task not found)
+// the helper bails immediately and the daemon falls back to /fail so the
+// UI shows a concrete failure rather than a perpetually-running task.
+func TestReportTaskResult_PermanentCompleteFallsBackToFail(t *testing.T) {
+	defer noSleepRetry(t)()
+
+	var completeCalls, failCalls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		switch {
+		case strings.HasSuffix(req.URL.Path, "/complete"):
+			completeCalls.Add(1)
+			w.WriteHeader(http.StatusBadRequest)
+		case strings.HasSuffix(req.URL.Path, "/fail"):
+			failCalls.Add(1)
+			w.WriteHeader(http.StatusOK)
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	d := &Daemon{client: NewClient(srv.URL), logger: slog.Default()}
+	d.reportTaskResult(context.Background(), "task-bad", TaskResult{
+		Status:  "completed",
+		Comment: "ok",
+	}, slog.Default())
+
+	if got := completeCalls.Load(); got != 1 {
+		t.Fatalf("permanent 400 should not retry, got %d complete attempts", got)
+	}
+	if got := failCalls.Load(); got != 1 {
+		t.Fatalf("permanent /complete should fall back to /fail exactly once, got %d", got)
 	}
 }
 
